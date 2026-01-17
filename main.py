@@ -381,6 +381,11 @@ class MistralMRZScanner:
         """
         Use Mistral chat model to extract structured MRZ data from OCR text
         This is used when OCR returns plain text instead of structured JSON
+
+        ANTI-HALLUCINATION GUARDS:
+        - Pre-validates OCR text before calling LLM
+        - Allows LLM to return error if no valid MRZ found
+        - Detects and rejects fake/sample data
         """
         import json
         import re
@@ -403,38 +408,59 @@ class MistralMRZScanner:
         cleaned_ocr_text = '\n'.join(filtered_lines)
         print(f"🧹 Cleaned OCR text: {cleaned_ocr_text[:200]}", flush=True)
 
+        # ===== PRE-CHECK #1: Validate OCR text quality BEFORE calling LLM =====
+        # Don't waste API tokens on garbage
+        if len(cleaned_ocr_text) < 30:
+            print(f"❌ Pre-check failed: OCR text too short ({len(cleaned_ocr_text)} chars, need 30+)", flush=True)
+            raise Exception("No valid passport MRZ found in image (text too short)")
+
+        # Count MRZ-relevant characters
+        filler_count = cleaned_ocr_text.count('<')
+        digit_count = sum(1 for c in cleaned_ocr_text if c.isdigit())
+
+        # Real MRZ should have multiple '<' fillers and digits (dates, passport numbers)
+        if filler_count < 3 and digit_count < 6:
+            print(f"❌ Pre-check failed: Not enough MRZ patterns (< count: {filler_count}, digits: {digit_count})", flush=True)
+            raise Exception("No valid passport MRZ found in image (missing MRZ pattern)")
+
         # Try manual extraction first (faster and more reliable)
         manual_result = self._manual_mrz_extraction(cleaned_ocr_text)
         if manual_result:
             return manual_result
 
-        # Fallback to Mistral if manual extraction fails
-        prompt = f"""Extract passport MRZ lines from this OCR text. Output STRICTLY two lines of exactly 44 characters each, separated by a newline.
+        # ===== FALLBACK TO MISTRAL WITH ANTI-HALLUCINATION PROMPT =====
+        prompt = f"""Analyze the following OCR text and determine if it contains a valid Passport MRZ (Machine Readable Zone).
 
 OCR Text:
 {cleaned_ocr_text}
 
-CRITICAL REQUIREMENTS:
-- Output EXACTLY TWO lines, each EXACTLY 44 characters
-- Line 1: Starts with 'P<', contains document type + country code + surname << given names
-- Line 2: Starts with passport number (9 chars), contains nationality, birth date, expiry, personal number
-- Use '<' as filler character (NOT spaces)
-- If the OCR text is concatenated (80+ characters), split it intelligently:
-  * Find where Line 2 starts (passport number pattern)
-  * Line 1 should be the 44 characters before that
-  * Line 2 should be the 44 characters starting from that point
-- Remove ALL spaces and newlines from the text before processing
-- Pad short lines with '<' at the end to reach exactly 44 characters
-- Truncate long lines to exactly 44 characters
+CRITICAL INSTRUCTIONS:
+1. If this text does NOT contain a valid passport MRZ pattern, return EXACTLY:
+   {{"error": "no_mrz_found"}}
 
-Return this exact JSON format (no markdown, no code blocks):
+2. DO NOT INVENT OR HALLUCINATE DATA. Only extract if you clearly see:
+   - Line 1: Starts with 'P<' or 'I<' or 'V<' (document type)
+   - Line 2: Contains passport number (9 chars) + nationality code (3 chars) + dates (YYMMDD format)
+   - Multiple '<' filler characters
+
+3. If you DO find a valid MRZ, extract it following these rules:
+   - Output EXACTLY TWO lines, each EXACTLY 44 characters
+   - Line 1: Document type (P< or I< or V<) + country + surname << given names
+   - Line 2: Passport number (9 chars) + check digit + nationality (3 chars) + DOB + sex + expiry + personal number
+   - Use '<' as filler (NOT spaces)
+   - Pad/truncate to exactly 44 characters per line
+
+Valid MRZ JSON format:
 {{"line1": "P<COUNTRY<SURNAME<<GIVENNAMES<<<<<<<<<<<<<<", "line2": "PASSPORTNUM<CDOBDATECSEXEXPIRYDATECZZZZZZZC"}}
 
-Replace the example values with the actual extracted data. Both lines MUST be exactly 44 characters."""
+ERROR format (if no valid MRZ):
+{{"error": "no_mrz_found"}}
 
-        print(f"🔄 Sending to Mistral extraction model...", flush=True)
+Return ONLY the JSON (no markdown, no explanations)."""
 
-        # Call Mistral chat API without response_format (not supported)
+        print(f"🔄 Sending to Mistral extraction model with anti-hallucination prompt...", flush=True)
+
+        # Call Mistral chat API
         response = self.client.chat.complete(
             model=self.extraction_model,
             messages=[{"role": "user", "content": prompt}]
@@ -455,7 +481,7 @@ Replace the example values with the actual extracted data. Both lines MUST be ex
             cleaned = cleaned.strip()
 
             # Try to find JSON object in the response
-            json_match = re.search(r'\{[^}]*"line1"[^}]*"line2"[^}]*\}', cleaned, re.DOTALL)
+            json_match = re.search(r'\{[^}]+\}', cleaned, re.DOTALL)
             if json_match:
                 cleaned = json_match.group(0)
 
@@ -465,18 +491,51 @@ Replace the example values with the actual extracted data. Both lines MUST be ex
             try:
                 result = json.loads(cleaned)
 
+                # ===== CHECK #2: Handle error response from LLM =====
+                if "error" in result:
+                    error_msg = result.get("error", "unknown")
+                    print(f"❌ Mistral detected no valid MRZ: {error_msg}", flush=True)
+                    raise Exception(f"No valid passport MRZ found in image ({error_msg})")
+
                 if "line1" not in result or "line2" not in result:
-                    raise Exception("Missing line1 or line2")
+                    raise Exception("Missing line1 or line2 in Mistral response")
 
                 # Ensure exactly 44 characters
                 result["line1"] = self._normalize_mrz_line(result["line1"])
                 result["line2"] = self._normalize_mrz_line(result["line2"])
 
-                print(f"   Line1 ({len(result['line1'])}): {result['line1']}", flush=True)
-                print(f"   Line2 ({len(result['line2'])}): {result['line2']}", flush=True)
+                # ===== CHECK #3: Detect fake/sample data (hallucination detection) =====
+                suspicious_patterns = [
+                    'SPECIMEN', 'SAMPLE', 'EXAMPLE', 'TEST',
+                    'JOHNDOE', 'JOHNSON', 'JOHNWILLIAM', 'JANEDOE',
+                    'MISTRAL', 'CLAUDE', 'OPENAI', 'ANTHROPIC',
+                    'AAAAA', 'BBBBB', 'XXXXX', 'ZZZZZ',
+                    '123456789', '000000000', '111111111'
+                ]
+
+                combined = (result["line1"] + result["line2"]).upper()
+                for pattern in suspicious_patterns:
+                    if pattern in combined:
+                        print(f"❌ Detected fake/sample data pattern: '{pattern}'", flush=True)
+                        raise Exception(f"No valid passport MRZ found in image (detected hallucinated data)")
+
+                # Additional check: Line 1 should start with valid document type
+                if not result["line1"].startswith(('P<', 'I<', 'V<', 'A<', 'C<')):
+                    print(f"❌ Invalid document type prefix: {result['line1'][:2]}", flush=True)
+                    raise Exception("No valid passport MRZ found in image (invalid document type)")
+
+                print(f"✅ Extracted MRZ using Mistral model", flush=True)
+                print(f"   Line 1: {result['line1']}", flush=True)
+                print(f"   Line 2: {result['line2']}", flush=True)
 
                 return result
-            except (json.JSONDecodeError, Exception) as e:
+            except json.JSONDecodeError as e:
+                print(f"❌ JSON parse error: {e}", flush=True)
+                raise Exception("No valid passport MRZ found in image (invalid JSON response)")
+            except Exception as e:
+                # Re-raise our custom exceptions
+                if "No valid passport MRZ found" in str(e):
+                    raise
                 print(f"❌ Mistral extraction failed: {e}", flush=True)
                 raise Exception(f"Failed to extract MRZ: {str(e)}")
         else:
