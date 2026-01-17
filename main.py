@@ -256,14 +256,31 @@ class MistralMRZScanner:
             split_pos = match.start()
             print(f"🎯 Found Line 2 anchor at position {split_pos}: {match.group()[:20]}...", flush=True)
 
-            # Line 1 is the 44 characters BEFORE this position
-            # Line 2 is the 44 characters STARTING FROM this position
-            line1 = text[split_pos - 44:split_pos] if split_pos >= 44 else text[:split_pos]
-            line2 = text[split_pos:split_pos + 44]
+            # Find where Line 1 actually starts by searching for document type prefix
+            # Search backwards from the split position to find 'P<' or 'I<'
+            line1_start = -1
+            # Look for P< (passport), I< (ID card), A< (travel doc), C< (crew), V< (visa)
+            for prefix in ['P<', 'I<', 'A<', 'C<', 'V<']:
+                pos = text.rfind(prefix, 0, split_pos)
+                if pos != -1:
+                    line1_start = pos
+                    print(f"🔍 Found Line 1 start '{prefix}' at position {line1_start}", flush=True)
+                    break
 
-            # If line1 is too short, pad from beginning of text
-            if len(line1) < 44 and split_pos < 44:
-                line1 = text[:44]
+            if line1_start != -1:
+                # Extract 44 characters from the Line 1 start position
+                line1 = text[line1_start:line1_start + 44]
+                line2 = text[split_pos:split_pos + 44]
+                print(f"📏 Extracted from positions: Line1[{line1_start}:{line1_start+44}], Line2[{split_pos}:{split_pos+44}]", flush=True)
+            else:
+                # Fallback to the old logic if we can't find the prefix
+                print(f"⚠️  Could not find document type prefix, using offset method", flush=True)
+                line1 = text[split_pos - 44:split_pos] if split_pos >= 44 else text[:split_pos]
+                line2 = text[split_pos:split_pos + 44]
+
+                # If line1 is too short, pad from beginning of text
+                if len(line1) < 44 and split_pos < 44:
+                    line1 = text[:44]
 
             # Normalize both lines to exactly 44 chars
             line1 = self._normalize_mrz_line(line1)
