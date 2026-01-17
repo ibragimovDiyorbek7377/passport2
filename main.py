@@ -238,48 +238,78 @@ class MistralMRZScanner:
 
     def _smart_split_mrz(self, text: str) -> tuple:
         """
-        Intelligently split concatenated MRZ by finding passport number pattern
-        Uzbek passports: 2 letters + 7 digits (e.g., FA1234567, FB0292047)
+        Intelligently split concatenated MRZ using anchor-based robust regex
+        Finds the start of Line 2 by matching: PassportNum(9) + Check(1) + Nationality(3) + DOB(6) + Check(1)
         """
         import re
 
-        # Pattern: 2 uppercase letters followed by 7 digits
-        # This is where Line 2 starts (passport number)
-        passport_pattern = re.compile(r'[A-Z]{2}\d{7}', re.IGNORECASE)
+        # CRITICAL: Sanitize text first - remove ALL spaces and newlines, keep '<'
+        text = text.replace(' ', '').replace('\n', '').replace('\r', '')
 
-        match = passport_pattern.search(text)
+        # Robust regex to find Line 2 start position
+        # Matches: Passport(9 chars) + Check(1 digit) + Nationality(3 chars) + DOB(6 digits) + DOB Check(1 digit)
+        # Example: Z9999999<0IND8505246
+        line2_anchor_pattern = re.compile(r'([A-Z0-9<]{9})(\d)([A-Z<]{3})(\d{6})(\d)', re.IGNORECASE)
+
+        match = line2_anchor_pattern.search(text)
         if match:
             split_pos = match.start()
-            print(f"🎯 Found passport number at position {split_pos}: {match.group()}", flush=True)
+            print(f"🎯 Found Line 2 anchor at position {split_pos}: {match.group()[:20]}...", flush=True)
 
-            line1 = text[:split_pos]
-            line2 = text[split_pos:]
+            # Line 1 is the 44 characters BEFORE this position
+            # Line 2 is the 44 characters STARTING FROM this position
+            line1 = text[split_pos - 44:split_pos] if split_pos >= 44 else text[:split_pos]
+            line2 = text[split_pos:split_pos + 44]
+
+            # If line1 is too short, pad from beginning of text
+            if len(line1) < 44 and split_pos < 44:
+                line1 = text[:44]
 
             # Normalize both lines to exactly 44 chars
             line1 = self._normalize_mrz_line(line1)
-            line2 = self._normalize_mrz_line(line2[:44])  # Take only first 44 chars of line2
+            line2 = self._normalize_mrz_line(line2)
+
+            print(f"✅ Smart split successful:", flush=True)
+            print(f"   Line1 (44): {line1}", flush=True)
+            print(f"   Line2 (44): {line2}", flush=True)
 
             return (line1, line2)
 
         # Fallback: blind split at 44
-        print(f"⚠️  Passport pattern not found, using position 44", flush=True)
-        return (text[:44], text[44:88] if len(text) >= 88 else text[44:])
+        print(f"⚠️  Line 2 anchor pattern not found, using position 44", flush=True)
+        line1 = self._normalize_mrz_line(text[:44])
+        line2 = self._normalize_mrz_line(text[44:88] if len(text) >= 88 else text[44:])
+        return (line1, line2)
 
     def _extract_mrz_lines(self, text: str) -> list:
-        """Extract MRZ lines from text"""
+        """Extract MRZ lines from text with improved sanitization"""
+        import re
+
         # MRZ lines for TD3 (passport) format:
         # - Line 1: 44 characters, starts with 'P<'
         # - Line 2: 44 characters, contains passport number, dates, etc.
         # Both lines use '<' as filler character
 
+        # First, check if we have a long concatenated string
+        # Sanitize: remove spaces and newlines but keep '<'
+        sanitized_text = text.replace(' ', '').replace('\n', '').replace('\r', '')
+
+        # If we have a long string (80+ chars) that looks like concatenated MRZ
+        if len(sanitized_text) >= 80 and ('P<' in sanitized_text.upper()[:10]):
+            # Use smart split with anchor-based regex
+            line1, line2 = self._smart_split_mrz(sanitized_text)
+            print(f"🔀 Smart split concatenated MRZ: {len(sanitized_text)} chars → 2 lines", flush=True)
+            return [line1, line2]
+
+        # Otherwise, try line-by-line extraction
         lines = text.split('\n')
         mrz_lines = []
 
         for line in lines:
-            # Clean the line
-            line = line.strip()
+            # Clean the line - remove spaces but keep '<'
+            line = line.strip().replace(' ', '')
 
-            # Check for concatenated MRZ (80+ characters)
+            # Check for concatenated MRZ within a single line (80+ characters)
             if len(line) >= 80 and (line.upper().startswith('P<') or 'P<' in line[:5].upper()):
                 # Use smart split to find passport number
                 line1, line2 = self._smart_split_mrz(line)
@@ -362,22 +392,28 @@ class MistralMRZScanner:
             return manual_result
 
         # Fallback to Mistral if manual extraction fails
-        prompt = f"""Extract passport MRZ lines from this OCR text. Return ONLY valid JSON with no markdown.
+        prompt = f"""Extract passport MRZ lines from this OCR text. Output STRICTLY two lines of exactly 44 characters each, separated by a newline.
 
 OCR Text:
 {cleaned_ocr_text}
 
-Requirements:
-- Extract TWO lines, each EXACTLY 44 characters
-- Line 1 starts with 'P<' (document type + country + name)
-- Line 2 has passport number, nationality, dates
-- Use '<' as filler
-- If concatenated, split at position 44
-- Pad short lines with '<' at the end
-- Truncate long lines to 44 characters
+CRITICAL REQUIREMENTS:
+- Output EXACTLY TWO lines, each EXACTLY 44 characters
+- Line 1: Starts with 'P<', contains document type + country code + surname << given names
+- Line 2: Starts with passport number (9 chars), contains nationality, birth date, expiry, personal number
+- Use '<' as filler character (NOT spaces)
+- If the OCR text is concatenated (80+ characters), split it intelligently:
+  * Find where Line 2 starts (passport number pattern)
+  * Line 1 should be the 44 characters before that
+  * Line 2 should be the 44 characters starting from that point
+- Remove ALL spaces and newlines from the text before processing
+- Pad short lines with '<' at the end to reach exactly 44 characters
+- Truncate long lines to exactly 44 characters
 
-Return this exact JSON format (no markdown):
-{{"line1": "44-char line 1", "line2": "44-char line 2"}}"""
+Return this exact JSON format (no markdown, no code blocks):
+{{"line1": "P<COUNTRY<SURNAME<<GIVENNAMES<<<<<<<<<<<<<<", "line2": "PASSPORTNUM<CDOBDATECSEXEXPIRYDATECZZZZZZZC"}}
+
+Replace the example values with the actual extracted data. Both lines MUST be exactly 44 characters."""
 
         print(f"🔄 Sending to Mistral extraction model...", flush=True)
 
@@ -442,6 +478,22 @@ Return this exact JSON format (no markdown):
         text = text.replace('><', '<<')  # Fix >< to <<
         text = text.replace('< ', '<').replace(' <', '<')  # Remove spaces around <
 
+        # CRITICAL: Try treating the entire text as one concatenated string first
+        # This handles the most common case where Mistral returns everything as one long line
+        sanitized_full_text = text.replace(' ', '').replace('\n', '').replace('\r', '')
+
+        # Check if the full sanitized text looks like concatenated MRZ (80+ chars with P<)
+        if len(sanitized_full_text) >= 80 and ('P<' in sanitized_full_text.upper()[:10]):
+            # Use smart split with robust anchor-based regex
+            line1, line2 = self._smart_split_mrz(sanitized_full_text)
+
+            print(f"✅ Manual extraction (full text concatenated {len(sanitized_full_text)} chars) succeeded", flush=True)
+            print(f"   Line1 ({len(line1)}): {line1}", flush=True)
+            print(f"   Line2 ({len(line2)}): {line2}", flush=True)
+
+            return {"line1": line1, "line2": line2}
+
+        # Otherwise, try line-by-line extraction
         lines = text.split('\n')
         mrz_candidates = []
 
@@ -451,12 +503,13 @@ Return this exact JSON format (no markdown):
             line = re.sub(r'</[^>]+>', '', line)
             line = line.replace('><', '<<')
             line = line.replace('< ', '<').replace(' <', '<')
+            line = line.replace(' ', '')  # Remove all spaces
 
             # Look for lines that start with P< or have MRZ characteristics
             if line.startswith('P<') or line.startswith('p<') or (len(line) >= 40 and '<' in line):
                 mrz_candidates.append(line)
 
-        # Try concatenated format first (most common issue)
+        # Try concatenated format (most common issue)
         for line in mrz_candidates:
             if len(line) >= 80:  # Two lines concatenated (at least 80 chars)
                 # Use smart split to find passport number pattern
