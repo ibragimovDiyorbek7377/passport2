@@ -1,0 +1,13 @@
+# Railway Deployment Marker
+# This file forces Railway to use the latest code
+# Last deployment: 2026-01-15 10:00:00 UTC
+# Version: 3.0.0
+# API: Mistral AI Pixtral-12B
+# Status: Ready for deployment with fixed dependencies
+
+BUILD_VERSION=3.0.0
+API_PROVIDER=mistralai
+MODEL=pixtral-12b-2409
+DEPENDENCIES_FIXED=true
+PYTHON_TELEGRAM_BOT=22.0+
+PYTHON_DATEUTIL=2.9.0+

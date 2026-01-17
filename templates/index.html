@@ -1,0 +1,921 @@
+<!DOCTYPE html>
+<html lang="uz">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Bojxona Passport Scanner</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --neon-green: #00F721;
+            --dark-bg: #0a0a0a;
+            --dark-card: #151515;
+            --dark-border: #252525;
+            --text-primary: #ffffff;
+            --text-secondary: #b0b0b0;
+            --error-red: #ff4444;
+            --success-green: #00F721;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: var(--dark-bg);
+            color: var(--text-primary);
+            overflow-x: hidden;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        .container {
+            max-width: 100vw;
+            min-height: 100vh;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+            padding: 20px 0;
+            border-bottom: 2px solid var(--neon-green);
+        }
+
+        .header h1 {
+            font-size: 24px;
+            font-weight: 700;
+            color: var(--neon-green);
+            text-shadow: 0 0 10px rgba(0, 247, 33, 0.5);
+            margin-bottom: 8px;
+        }
+
+        .header p {
+            font-size: 14px;
+            color: var(--text-secondary);
+        }
+
+        .camera-section {
+            background: var(--dark-card);
+            border: 2px solid var(--dark-border);
+            border-radius: 16px;
+            padding: 20px;
+            margin-bottom: 20px;
+            position: relative;
+        }
+
+        .camera-container {
+            position: relative;
+            width: 100%;
+            aspect-ratio: 4/3;
+            background: #000;
+            border-radius: 12px;
+            overflow: hidden;
+            margin-bottom: 20px;
+        }
+
+        #camera-stream {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        #canvas-preview {
+            display: none;
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+        }
+
+        /* Passport Guide Frame - CRITICAL: #00F721 - MRZ ONLY */
+        .passport-guide {
+            position: absolute;
+            bottom: 15%;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 90%;
+            height: 18%;
+            border: 3px solid var(--neon-green);
+            border-radius: 8px;
+            box-shadow:
+                0 0 20px rgba(0, 247, 33, 0.6),
+                inset 0 0 20px rgba(0, 247, 33, 0.2);
+            pointer-events: none;
+            z-index: 10;
+        }
+
+        .passport-guide::before {
+            content: '';
+            position: absolute;
+            top: -20px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: var(--dark-bg);
+            color: var(--neon-green);
+            padding: 4px 12px;
+            border-radius: 6px;
+            font-size: 12px;
+            font-weight: 600;
+            white-space: nowrap;
+        }
+
+        .passport-guide.scanning::before {
+            content: '⚡ MRZ Skanerlash...';
+        }
+
+        .passport-guide:not(.scanning)::before {
+            content: '📄 MRZ (pastdagi 2 qator)ni bu yerga joylashtiring';
+        }
+
+        /* Corner markers for guide */
+        .passport-guide::after,
+        .corner-tl, .corner-tr, .corner-bl, .corner-br {
+            position: absolute;
+            width: 20px;
+            height: 20px;
+            border: 3px solid var(--neon-green);
+        }
+
+        .corner-tl {
+            top: -3px;
+            left: -3px;
+            border-right: none;
+            border-bottom: none;
+        }
+
+        .corner-tr {
+            top: -3px;
+            right: -3px;
+            border-left: none;
+            border-bottom: none;
+        }
+
+        .corner-bl {
+            bottom: -3px;
+            left: -3px;
+            border-right: none;
+            border-top: none;
+        }
+
+        .corner-br {
+            bottom: -3px;
+            right: -3px;
+            border-left: none;
+            border-top: none;
+        }
+
+        /* Scanning animation */
+        @keyframes scan-line {
+            0%, 100% { top: 0; opacity: 0; }
+            50% { top: 100%; opacity: 1; }
+        }
+
+        .scan-line {
+            display: none;
+            position: absolute;
+            width: 100%;
+            height: 2px;
+            background: var(--neon-green);
+            box-shadow: 0 0 10px var(--neon-green);
+            animation: scan-line 2s ease-in-out infinite;
+            z-index: 11;
+        }
+
+        .scanning .scan-line {
+            display: block;
+        }
+
+        .btn {
+            width: 100%;
+            padding: 16px;
+            border: none;
+            border-radius: 12px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .btn-primary {
+            background: var(--neon-green);
+            color: #000;
+            box-shadow: 0 4px 20px rgba(0, 247, 33, 0.4);
+        }
+
+        .btn-primary:hover {
+            background: #00d91e;
+            box-shadow: 0 6px 30px rgba(0, 247, 33, 0.6);
+            transform: translateY(-2px);
+        }
+
+        .btn-primary:active {
+            transform: translateY(0);
+        }
+
+        /* Success glow animation */
+        @keyframes success-glow {
+            0%, 100% { box-shadow: 0 4px 20px rgba(0, 247, 33, 0.4); }
+            50% { box-shadow: 0 8px 40px rgba(0, 247, 33, 0.8); }
+        }
+
+        .btn-primary.success {
+            animation: success-glow 1s ease-in-out;
+        }
+
+        .btn-secondary {
+            background: var(--dark-border);
+            color: var(--text-primary);
+            margin-top: 10px;
+        }
+
+        .btn-secondary:hover {
+            background: #353535;
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .results-section {
+            display: none;
+            background: var(--dark-card);
+            border: 2px solid var(--dark-border);
+            border-radius: 16px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+
+        .results-section.show {
+            display: block;
+            animation: slideIn 0.3s ease-out;
+        }
+
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateY(20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .result-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 20px;
+            padding-bottom: 15px;
+            border-bottom: 2px solid var(--neon-green);
+        }
+
+        .result-header h2 {
+            font-size: 20px;
+            color: var(--neon-green);
+        }
+
+        .validation-badge {
+            padding: 6px 12px;
+            border-radius: 6px;
+            font-size: 12px;
+            font-weight: 700;
+        }
+
+        .validation-badge.pass {
+            background: rgba(0, 247, 33, 0.2);
+            color: var(--success-green);
+            border: 1px solid var(--success-green);
+        }
+
+        .validation-badge.fail {
+            background: rgba(255, 68, 68, 0.2);
+            color: var(--error-red);
+            border: 1px solid var(--error-red);
+        }
+
+        .data-grid {
+            display: grid;
+            gap: 15px;
+        }
+
+        .data-item {
+            background: var(--dark-bg);
+            padding: 15px;
+            border-radius: 10px;
+            border-left: 3px solid var(--neon-green);
+        }
+
+        .data-label {
+            font-size: 12px;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 6px;
+        }
+
+        .data-value {
+            font-size: 16px;
+            color: var(--text-primary);
+            font-weight: 600;
+        }
+
+        .data-value.highlight {
+            color: var(--neon-green);
+        }
+
+        .validation-details {
+            margin-top: 20px;
+            padding: 15px;
+            background: var(--dark-bg);
+            border-radius: 10px;
+        }
+
+        .validation-details h3 {
+            font-size: 14px;
+            color: var(--text-secondary);
+            margin-bottom: 10px;
+        }
+
+        .validation-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 0;
+            border-bottom: 1px solid var(--dark-border);
+        }
+
+        .validation-item:last-child {
+            border-bottom: none;
+        }
+
+        .validation-icon {
+            font-size: 18px;
+        }
+
+        .loading {
+            display: none;
+            text-align: center;
+            padding: 20px;
+        }
+
+        .loading.show {
+            display: block;
+        }
+
+        .spinner {
+            border: 3px solid var(--dark-border);
+            border-top: 3px solid var(--neon-green);
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 10px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .error-message {
+            display: none;
+            background: rgba(255, 68, 68, 0.1);
+            border: 1px solid var(--error-red);
+            color: var(--error-red);
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+        }
+
+        .error-message.show {
+            display: block;
+        }
+
+        .footer {
+            margin-top: auto;
+            padding-top: 20px;
+            text-align: center;
+            color: var(--text-secondary);
+            font-size: 12px;
+        }
+
+        .footer a {
+            color: var(--neon-green);
+            text-decoration: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🛂 PASSPORT SCANNER</h1>
+            <p>Powered by Mistral AI Vision</p>
+        </div>
+
+        <div class="error-message" id="error-message"></div>
+
+        <div class="camera-section">
+            <div class="camera-container">
+                <video id="camera-stream" autoplay playsinline></video>
+                <canvas id="canvas-preview"></canvas>
+                <div class="passport-guide" id="passport-guide">
+                    <div class="corner-tl"></div>
+                    <div class="corner-tr"></div>
+                    <div class="corner-bl"></div>
+                    <div class="corner-br"></div>
+                    <div class="scan-line"></div>
+                </div>
+            </div>
+
+            <button class="btn btn-primary" id="capture-btn">
+                📷 Rasmga Olish
+            </button>
+            <button class="btn btn-secondary" id="upload-btn">
+                📁 Galereyadan Yuklash
+            </button>
+            <input type="file" id="file-input" accept="image/*" style="display: none;">
+            <button class="btn btn-secondary" id="retake-btn" style="display: none;">
+                🔄 Qayta Olish
+            </button>
+        </div>
+
+        <div class="loading" id="loading">
+            <div class="spinner"></div>
+            <p>Skanerlash va validatsiya...</p>
+        </div>
+
+        <div class="results-section" id="results-section">
+            <div class="result-header">
+                <h2>📋 Natijalar</h2>
+                <span class="validation-badge" id="validation-badge">PASS</span>
+            </div>
+
+            <div class="data-grid" id="data-grid">
+                <!-- Results will be inserted here -->
+            </div>
+
+            <div class="validation-details" id="validation-details">
+                <!-- Validation details will be inserted here -->
+            </div>
+
+            <button class="btn btn-primary" id="scan-another-btn">
+                ➕ Yana Skanerlash
+            </button>
+        </div>
+
+        <div class="footer">
+            <p>Telegram Mini App - Passport Scanner</p>
+            <p>Powered by <a href="#">Mistral AI OCR-2512</a> | v3.0.0</p>
+        </div>
+    </div>
+
+    <script>
+        // Telegram Web App initialization
+        const tg = window.Telegram.WebApp;
+        tg.expand();
+        tg.ready();
+
+        // DOM elements
+        const cameraStream = document.getElementById('camera-stream');
+        const canvasPreview = document.getElementById('canvas-preview');
+        const captureBtn = document.getElementById('capture-btn');
+        const uploadBtn = document.getElementById('upload-btn');
+        const fileInput = document.getElementById('file-input');
+        const retakeBtn = document.getElementById('retake-btn');
+        const passportGuide = document.getElementById('passport-guide');
+        const loading = document.getElementById('loading');
+        const resultsSection = document.getElementById('results-section');
+        const errorMessage = document.getElementById('error-message');
+        const scanAnotherBtn = document.getElementById('scan-another-btn');
+
+        let stream = null;
+        let capturedImageBlob = null;
+        let cameraAvailable = false;
+
+        // Initialize camera with flexible constraints for all devices
+        async function initCamera() {
+            try {
+                // Try with flexible constraints (works on ALL devices)
+                const constraints = {
+                    video: {
+                        facingMode: 'environment',
+                        width: { ideal: 1920 },
+                        height: { ideal: 1080 }
+                    }
+                };
+
+                // Check if camera is available
+                if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                    throw new Error('Camera not supported');
+                }
+
+                stream = await navigator.mediaDevices.getUserMedia(constraints);
+                cameraStream.srcObject = stream;
+                cameraAvailable = true;
+                hideError();
+
+                console.log('✅ Camera initialized successfully');
+            } catch (error) {
+                console.warn('⚠️ Camera initialization failed:', error);
+                cameraAvailable = false;
+
+                // Hide camera controls, show upload only
+                cameraStream.style.display = 'none';
+                captureBtn.style.display = 'none';
+                passportGuide.style.display = 'none';
+
+                showError('📱 Kamera ishlamayapti.\n\nIltimos, "Galereyadan Yuklash" tugmasini ishlating.');
+            }
+        }
+
+        // Capture photo with MRZ-only cropping for speed optimization
+        function capturePhoto() {
+            // Create full-size canvas from video
+            const fullCanvas = document.createElement('canvas');
+            fullCanvas.width = cameraStream.videoWidth;
+            fullCanvas.height = cameraStream.videoHeight;
+            const fullCtx = fullCanvas.getContext('2d');
+            fullCtx.drawImage(cameraStream, 0, 0);
+
+            // Calculate MRZ crop area based on overlay position
+            // The overlay is positioned at bottom 15%, width 90%, height 18%
+            const cameraContainer = document.querySelector('.camera-container');
+            const containerWidth = cameraContainer.clientWidth;
+            const containerHeight = cameraContainer.clientHeight;
+
+            // Video aspect ratio might differ from container
+            const videoAspect = fullCanvas.width / fullCanvas.height;
+            const containerAspect = containerWidth / containerHeight;
+
+            let renderWidth, renderHeight, offsetX, offsetY;
+
+            if (videoAspect > containerAspect) {
+                // Video is wider - height matches, width is cropped
+                renderHeight = containerHeight;
+                renderWidth = containerHeight * videoAspect;
+                offsetX = (renderWidth - containerWidth) / 2;
+                offsetY = 0;
+            } else {
+                // Video is taller - width matches, height is cropped
+                renderWidth = containerWidth;
+                renderHeight = containerWidth / videoAspect;
+                offsetX = 0;
+                offsetY = (renderHeight - containerHeight) / 2;
+            }
+
+            // Calculate MRZ box position in video coordinates
+            const overlayWidthPercent = 0.90;
+            const overlayHeightPercent = 0.18;
+            const overlayBottomPercent = 0.15;
+
+            const overlayWidth = containerWidth * overlayWidthPercent;
+            const overlayHeight = containerHeight * overlayHeightPercent;
+            const overlayX = (containerWidth - overlayWidth) / 2;
+            const overlayY = containerHeight * (1 - overlayBottomPercent - overlayHeightPercent);
+
+            // Convert to video coordinates
+            const scaleX = fullCanvas.width / renderWidth;
+            const scaleY = fullCanvas.height / renderHeight;
+
+            const cropX = (overlayX + offsetX) * scaleX;
+            const cropY = (overlayY + offsetY) * scaleY;
+            const cropWidth = overlayWidth * scaleX;
+            const cropHeight = overlayHeight * scaleY;
+
+            // Create cropped canvas (MRZ only)
+            const croppedCanvas = document.createElement('canvas');
+            croppedCanvas.width = cropWidth;
+            croppedCanvas.height = cropHeight;
+            const croppedCtx = croppedCanvas.getContext('2d');
+            croppedCtx.drawImage(
+                fullCanvas,
+                cropX, cropY, cropWidth, cropHeight,
+                0, 0, cropWidth, cropHeight
+            );
+
+            // Resize to width ~1000px for speed optimization
+            const maxWidth = 1000;
+            let finalCanvas = croppedCanvas;
+
+            if (croppedCanvas.width > maxWidth) {
+                const scale = maxWidth / croppedCanvas.width;
+                finalCanvas = document.createElement('canvas');
+                finalCanvas.width = maxWidth;
+                finalCanvas.height = croppedCanvas.height * scale;
+                const finalCtx = finalCanvas.getContext('2d');
+
+                // High quality resize
+                finalCtx.imageSmoothingEnabled = true;
+                finalCtx.imageSmoothingQuality = 'high';
+                finalCtx.drawImage(croppedCanvas, 0, 0, finalCanvas.width, finalCanvas.height);
+            }
+
+            // Show preview (cropped MRZ area)
+            canvasPreview.width = finalCanvas.width;
+            canvasPreview.height = finalCanvas.height;
+            canvasPreview.getContext('2d').drawImage(finalCanvas, 0, 0);
+
+            // Stop camera and show preview
+            stopCamera();
+            cameraStream.style.display = 'none';
+            canvasPreview.style.display = 'block';
+            captureBtn.style.display = 'none';
+            retakeBtn.style.display = 'block';
+            passportGuide.classList.add('scanning');
+
+            // Convert to blob (quality 0.95 for MRZ clarity)
+            finalCanvas.toBlob(async (blob) => {
+                capturedImageBlob = blob;
+                console.log(`📸 MRZ area captured: ${finalCanvas.width}x${finalCanvas.height}, Size: ${(blob.size/1024).toFixed(1)}KB`);
+                await scanPassport(blob);
+            }, 'image/jpeg', 0.95);
+        }
+
+        // Scan passport via API
+        async function scanPassport(imageBlob) {
+            loading.classList.add('show');
+            hideError();
+            resultsSection.classList.remove('show');
+
+            const formData = new FormData();
+            formData.append('file', imageBlob, 'passport.jpg');
+
+            try {
+                const response = await fetch('/scan', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                const result = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(result.detail || 'Skanerlashda xatolik');
+                }
+
+                displayResults(result.data);
+                captureBtn.classList.add('success');
+                setTimeout(() => captureBtn.classList.remove('success'), 1000);
+
+            } catch (error) {
+                // Show detailed error message
+                const errorMsg = error.message || 'Noma\'lum xato';
+                showError(errorMsg);
+                // Show retake options
+                setTimeout(() => {
+                    retakeBtn.style.display = 'block';
+                    uploadBtn.style.display = 'block';
+                    if (cameraAvailable) {
+                        captureBtn.style.display = 'none';
+                    }
+                }, 500);
+            } finally {
+                loading.classList.remove('show');
+                passportGuide.classList.remove('scanning');
+            }
+        }
+
+        // Display results
+        function displayResults(data) {
+            resultsSection.classList.add('show');
+
+            // Validation badge
+            const badge = document.getElementById('validation-badge');
+            badge.textContent = data.validation_status;
+            badge.className = `validation-badge ${data.validation_status.toLowerCase()}`;
+
+            // Data grid
+            const dataGrid = document.getElementById('data-grid');
+            dataGrid.innerHTML = `
+                <div class="data-item">
+                    <div class="data-label">Pasport Raqami</div>
+                    <div class="data-value highlight">${data.passport_number}</div>
+                </div>
+                <div class="data-item">
+                    <div class="data-label">Familiya</div>
+                    <div class="data-value">${data.surname}</div>
+                </div>
+                <div class="data-item">
+                    <div class="data-label">Ism</div>
+                    <div class="data-value">${data.given_names}</div>
+                </div>
+                <div class="data-item">
+                    <div class="data-label">JSHSHIR / PNFL</div>
+                    <div class="data-value highlight">${data.personal_number || 'N/A'}</div>
+                </div>
+                <div class="data-item">
+                    <div class="data-label">Tug'ilgan Sana</div>
+                    <div class="data-value">${data.date_of_birth}</div>
+                </div>
+                <div class="data-item">
+                    <div class="data-label">Jins</div>
+                    <div class="data-value">${data.sex}</div>
+                </div>
+                <div class="data-item">
+                    <div class="data-label">Amal Qilish Muddati</div>
+                    <div class="data-value">${data.date_of_expiry}</div>
+                </div>
+                <div class="data-item">
+                    <div class="data-label">Millat</div>
+                    <div class="data-value">${data.nationality}</div>
+                </div>
+            `;
+
+            // Validation details
+            const validationDetails = document.getElementById('validation-details');
+            const validations = data.validations;
+            validationDetails.innerHTML = `
+                <h3>🔐 ICAO 9303 Validatsiya</h3>
+                ${Object.entries(validations).map(([key, value]) => `
+                    <div class="validation-item">
+                        <span>${formatValidationKey(key)}</span>
+                        <span class="validation-icon">${value ? '✅' : '❌'}</span>
+                    </div>
+                `).join('')}
+            `;
+
+            // Notify Telegram
+            if (tg && tg.sendData) {
+                tg.sendData(JSON.stringify(data));
+            }
+        }
+
+        // Format validation keys
+        function formatValidationKey(key) {
+            const labels = {
+                'passport_number_valid': 'Pasport Raqami Checksum',
+                'dob_valid': 'Tug\'ilgan Sana Checksum',
+                'expiry_valid': 'Amal Qilish Checksum',
+                'personal_number_valid': 'JSHSHIR Checksum',
+                'composite_valid': 'Composite Checksum',
+                'dob_format_valid': 'Tug\'ilgan Sana Format',
+                'expiry_format_valid': 'Amal Qilish Format'
+            };
+            return labels[key] || key;
+        }
+
+        // Retake photo
+        function retakePhoto() {
+            canvasPreview.style.display = 'none';
+            retakeBtn.style.display = 'none';
+            resultsSection.classList.remove('show');
+            hideError();
+
+            // Reset file input
+            fileInput.value = '';
+
+            // If camera is available, show it
+            if (cameraAvailable) {
+                cameraStream.style.display = 'block';
+                captureBtn.style.display = 'block';
+                passportGuide.style.display = 'block';
+                initCamera();
+            } else {
+                // Camera not available, just show upload button
+                captureBtn.style.display = 'none';
+                passportGuide.style.display = 'none';
+            }
+
+            // Always show upload button
+            uploadBtn.style.display = 'block';
+        }
+
+        // Show/hide error
+        function showError(message) {
+            errorMessage.textContent = '⚠️ ' + message;
+            errorMessage.classList.add('show');
+        }
+
+        function hideError() {
+            errorMessage.classList.remove('show');
+        }
+
+        // Stop camera
+        function stopCamera() {
+            if (stream) {
+                stream.getTracks().forEach(track => track.stop());
+                stream = null;
+            }
+        }
+
+        // Handle file upload from gallery (with MRZ cropping)
+        function handleFileUpload(event) {
+            const file = event.target.files[0];
+
+            if (!file) {
+                return;
+            }
+
+            // Validate file type
+            if (!file.type.startsWith('image/')) {
+                showError('❌ Iltimos, faqat rasm faylini yuklang (JPG, PNG)');
+                return;
+            }
+
+            // Validate file size (max 10MB)
+            if (file.size > 10 * 1024 * 1024) {
+                showError('❌ Rasm hajmi juda katta. Maksimal hajm: 10MB');
+                return;
+            }
+
+            console.log(`📁 File selected: ${file.name} (${(file.size/1024).toFixed(1)}KB)`);
+
+            // Read file and display preview
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                const img = new Image();
+                img.onload = function() {
+                    // Create full canvas
+                    const fullCanvas = document.createElement('canvas');
+                    fullCanvas.width = img.width;
+                    fullCanvas.height = img.height;
+                    const fullCtx = fullCanvas.getContext('2d');
+                    fullCtx.drawImage(img, 0, 0);
+
+                    // Crop MRZ area (bottom 18% of image, centered 90% width)
+                    const cropHeight = fullCanvas.height * 0.18;
+                    const cropWidth = fullCanvas.width * 0.90;
+                    const cropX = (fullCanvas.width - cropWidth) / 2;
+                    const cropY = fullCanvas.height * (1 - 0.15 - 0.18);
+
+                    const croppedCanvas = document.createElement('canvas');
+                    croppedCanvas.width = cropWidth;
+                    croppedCanvas.height = cropHeight;
+                    const croppedCtx = croppedCanvas.getContext('2d');
+                    croppedCtx.drawImage(
+                        fullCanvas,
+                        cropX, cropY, cropWidth, cropHeight,
+                        0, 0, cropWidth, cropHeight
+                    );
+
+                    // Resize to width ~1000px for speed
+                    const maxWidth = 1000;
+                    let finalCanvas = croppedCanvas;
+
+                    if (croppedCanvas.width > maxWidth) {
+                        const scale = maxWidth / croppedCanvas.width;
+                        finalCanvas = document.createElement('canvas');
+                        finalCanvas.width = maxWidth;
+                        finalCanvas.height = croppedCanvas.height * scale;
+                        const finalCtx = finalCanvas.getContext('2d');
+
+                        finalCtx.imageSmoothingEnabled = true;
+                        finalCtx.imageSmoothingQuality = 'high';
+                        finalCtx.drawImage(croppedCanvas, 0, 0, finalCanvas.width, finalCanvas.height);
+                    }
+
+                    // Show preview (cropped MRZ)
+                    canvasPreview.width = finalCanvas.width;
+                    canvasPreview.height = finalCanvas.height;
+                    canvasPreview.getContext('2d').drawImage(finalCanvas, 0, 0);
+
+                    // Hide camera, show preview
+                    if (cameraAvailable) {
+                        stopCamera();
+                        cameraStream.style.display = 'none';
+                    }
+                    canvasPreview.style.display = 'block';
+                    captureBtn.style.display = 'none';
+                    uploadBtn.style.display = 'none';
+                    retakeBtn.style.display = 'block';
+                    passportGuide.classList.add('scanning');
+
+                    // Convert to blob and scan
+                    finalCanvas.toBlob(async (blob) => {
+                        capturedImageBlob = blob;
+                        console.log(`✅ MRZ cropped from gallery: ${finalCanvas.width}x${finalCanvas.height}, Size: ${(blob.size/1024).toFixed(1)}KB`);
+                        await scanPassport(blob);
+                    }, 'image/jpeg', 0.95);
+                };
+                img.src = e.target.result;
+            };
+            reader.readAsDataURL(file);
+        }
+
+        // Trigger file input click
+        function openFileUpload() {
+            fileInput.click();
+        }
+
+        // Event listeners
+        captureBtn.addEventListener('click', capturePhoto);
+        uploadBtn.addEventListener('click', openFileUpload);
+        fileInput.addEventListener('change', handleFileUpload);
+        retakeBtn.addEventListener('click', retakePhoto);
+        scanAnotherBtn.addEventListener('click', retakePhoto);
+
+        // Initialize on load
+        window.addEventListener('load', initCamera);
+
+        // Cleanup on unload
+        window.addEventListener('beforeunload', stopCamera);
+    </script>
+</body>
+</html>
