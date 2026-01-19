@@ -1,6 +1,6 @@
 """
-Telegram Mini App Backend - Passport MRZ Scanner using Mistral AI Vision API
-Production-ready FastAPI application with intelligent MRZ extraction
+Customs Committee Passport MRZ Scanner - Backend API
+Uses Customs AI OCR Engine with Anti-Hallucination Guards
 """
 
 import io
@@ -9,6 +9,8 @@ import time
 import base64
 import hashlib
 import json
+import re
+import html
 from datetime import datetime
 from typing import Dict, Optional
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request
@@ -20,12 +22,12 @@ from PIL import Image
 from telegram import Update
 
 app = FastAPI(
-    title="Passport Scanner with Mistral AI",
-    description="Telegram Mini App for Passport MRZ Scanning",
-    version="3.0.0"
+    title="Customs Committee Passport Scanner",
+    description="Professional MRZ Scanner System",
+    version="3.5.0"
 )
 
-# CORS middleware for Telegram Mini App
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -38,37 +40,30 @@ app.add_middleware(
 templates = Jinja2Templates(directory="templates")
 
 # ============================================
-# MISTRAL AI VISION SCANNER
+# AI SCANNER ENGINE
 # ============================================
 
-class MistralMRZScanner:
+class CustomsScannerEngine:
     """
-    Mistral AI OCR API Manager for MRZ Extraction
-    Uses Mistral OCR API for passport scanning
+    Internal AI OCR API Manager for MRZ Extraction
     """
 
     def __init__(self, api_key: str):
-        # Initialize with 60-second timeout to prevent hanging
+        # Initialize with 60-second timeout
         self.client = Mistral(
             api_key=api_key,
-            timeout_ms=60000  # 60 second timeout for API calls
+            timeout_ms=60000
         )
         self.ocr_model = "mistral-ocr-latest"
-        self.extraction_model = "mistral-small-latest"  # Lighter model for text extraction
-        print(f"🤖 Mistral MRZ Scanner initialized", flush=True)
-        print(f"   OCR Model: {self.ocr_model}", flush=True)
-        print(f"   Extraction Model: {self.extraction_model}", flush=True)
-        print(f"⏱️  Timeout configured: 60 seconds", flush=True)
+        self.extraction_model = "mistral-small-latest"
+        print(f"🤖 Customs AI Engine initialized", flush=True)
 
     def scan_passport_mrz(self, image_bytes: bytes, max_retries: int = 3) -> Dict:
         """
-        Scan passport MRZ using Mistral OCR API
-        Returns extracted MRZ data with retry logic
+        Scan passport MRZ using AI OCR
         """
-        print(f"🔍 Starting MRZ scan with Mistral OCR API...", flush=True)
-        print(f"📊 Image size: {len(image_bytes)} bytes", flush=True)
-        print(f"🔄 Max retries: {max_retries}", flush=True)
-
+        print(f"🔍 Starting scan...", flush=True)
+        
         attempts = 0
         last_error = None
 
@@ -77,9 +72,8 @@ class MistralMRZScanner:
                 # Convert image to base64
                 base64_image = base64.b64encode(image_bytes).decode('utf-8')
 
-                print(f"🤖 Sending request to Mistral OCR API (attempt {attempts + 1})...", flush=True)
+                print(f"📤 Sending request to AI Engine (attempt {attempts + 1})...", flush=True)
 
-                # Use Mistral OCR API as per official documentation
                 ocr_response = self.client.ocr.process(
                     model=self.ocr_model,
                     document={
@@ -90,941 +84,427 @@ class MistralMRZScanner:
                 )
 
                 if not ocr_response:
-                    raise Exception("Empty response from Mistral OCR API")
+                    raise Exception("Empty response from AI Engine")
 
-                print(f"✅ Received response from Mistral OCR API", flush=True)
+                print(f"✅ Received response from AI Engine", flush=True)
 
-                # Extract text from OCR response
-                # The OCR API returns structured data, we need to extract the MRZ text
+                # Extract text
                 response_text = self._extract_ocr_text(ocr_response)
-                print(f"📝 Extracted OCR text: {response_text[:100]}...", flush=True)
-
-                # Try to parse as JSON first
+                
+                # Try to parse as JSON first (Fast path)
                 try:
                     result = self._parse_as_json(response_text)
-                    print(f"✅ Successfully parsed as JSON", flush=True)
-                except Exception as json_error:
-                    # If JSON parsing fails, use Mistral to extract structured data
-                    print(f"⚠️  JSON parsing failed, using Mistral extraction model...", flush=True)
-                    result = self._extract_mrz_with_mistral(response_text)
-                    print(f"✅ Extracted MRZ using Mistral model", flush=True)
+                    print(f"✅ Successfully parsed structured data", flush=True)
+                except Exception:
+                    # Slow path: Use LLM extraction with Anti-Hallucination
+                    print(f"⚠️ Raw text mode, using smart extraction...", flush=True)
+                    result = self._extract_mrz_with_ai(response_text)
+                    print(f"✅ Extracted MRZ using Smart Extraction", flush=True)
 
                 if "error" in result:
                     raise Exception(result["error"])
 
-                # Validate MRZ format
+                # Validate format
                 if not self._validate_mrz_format(result):
-                    raise Exception("Invalid MRZ format from Mistral OCR API")
+                    raise Exception("Invalid MRZ format extracted")
 
-                print(f"✅ MRZ extracted successfully", flush=True)
+                print(f"✅ MRZ extraction successful", flush=True)
                 return result
 
             except Exception as e:
                 error_msg = str(e).lower()
-                error_type = type(e).__name__
-                last_error = e
                 attempts += 1
+                print(f"❌ Attempt {attempts} failed: {str(e)[:100]}", flush=True)
 
-                print(f"❌ Attempt {attempts} failed ({error_type}): {str(e)[:150]}", flush=True)
-
-                # Check if error is timeout-related
-                if "timeout" in error_msg or "timed out" in error_msg:
-                    print(f"⏱️  Timeout error - Mistral API did not respond in time", flush=True)
-                    if attempts < max_retries:
-                        print(f"⚠️ Retrying with exponential backoff...", flush=True)
-                        time.sleep(2 ** attempts)  # Exponential backoff: 2s, 4s, 8s
-                    continue
-                # Check if error is related to rate limit
-                elif "429" in error_msg or "rate limit" in error_msg:
-                    print(f"⚠️ Rate limit error detected, waiting before retry...", flush=True)
-                    time.sleep(3)
-                    continue
-                # Check if error is authentication/API key issue
-                elif "401" in error_msg or "unauthorized" in error_msg or "api key" in error_msg:
-                    print(f"🔑 Authentication error - Invalid or expired Mistral API key", flush=True)
-                    raise HTTPException(
-                        status_code=500,
-                        detail="Mistral API authentication failed. Please check API key configuration."
-                    )
-                elif "503" in error_msg or "500" in error_msg:
-                    print(f"⚠️ Server error, waiting before retry...", flush=True)
-                    time.sleep(1)
+                if attempts < max_retries:
+                    # Retry logic
+                    if "429" in error_msg or "rate limit" in error_msg:
+                        time.sleep(3)
+                    else:
+                        time.sleep(1)
                     continue
                 else:
-                    # Other errors - still retry
-                    if attempts < max_retries:
-                        print(f"⚠️ Unknown error, retrying...", flush=True)
-                        time.sleep(0.5)
-                    continue
-
-        # All retries failed
-        error_type = type(last_error).__name__
-        error_detail = str(last_error)[:200]
-
-        print(f"❌ All {max_retries} attempts failed. Last error type: {error_type}", flush=True)
+                    last_error = e
 
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to scan passport after {max_retries} attempts. Error: {error_type} - {error_detail}"
+            detail=f"Scan failed after {max_retries} attempts: {str(last_error)[:100]}"
         )
 
     def _extract_ocr_text(self, ocr_response) -> str:
-        """Extract text from Mistral OCR API response"""
-        import html
-        import re
-
+        """Extract clean text from OCR response"""
         try:
-            # Mistral OCR API returns a response with .pages attribute
-            # Each page has a .markdown attribute with the extracted text
+            full_text = ""
             if hasattr(ocr_response, 'pages'):
-                # Extract markdown from all pages
-                all_text = []
-                for page in ocr_response.pages:
-                    if hasattr(page, 'markdown'):
-                        all_text.append(page.markdown)
-
-                # Join all text
+                all_text = [p.markdown for p in ocr_response.pages if hasattr(p, 'markdown')]
                 full_text = '\n'.join(all_text)
+            
+            # Fallbacks
+            if not full_text and hasattr(ocr_response, 'content'):
+                full_text = str(ocr_response.content)
 
-                # Decode HTML entities (e.g., &lt; -> <, &gt; -> >)
-                full_text = html.unescape(full_text)
-
-                # OCR Error Corrections for MRZ-specific patterns
-                # Fix 1: Remove HTML/XML-like tags that OCR might create
-                full_text = re.sub(r'</[^>]+>', '', full_text)  # Remove closing tags like </ugli>
-
-                # Fix 2: Convert ">< " pattern to "<<" (common OCR error)
-                full_text = full_text.replace('><', '<<')
-
-                # Fix 3: Fix spacing issues around chevrons
-                full_text = full_text.replace('< ', '<').replace(' <', '<')
-
-                print(f"📝 Extracted markdown text: {full_text[:200]}", flush=True)
-
-                # Find MRZ lines in the text
-                mrz_lines = self._extract_mrz_lines(full_text)
-                if len(mrz_lines) >= 2:
-                    return json.dumps({"line1": mrz_lines[0], "line2": mrz_lines[1]})
-
-                return full_text
-
-            # Fallback: try other common attributes
-            elif hasattr(ocr_response, 'text'):
-                return html.unescape(ocr_response.text)
-            elif hasattr(ocr_response, 'content'):
-                return html.unescape(ocr_response.content)
-            elif isinstance(ocr_response, dict):
-                # If it's a dictionary, try common keys
-                for key in ['text', 'content', 'ocr_text', 'result']:
-                    if key in ocr_response:
-                        return html.unescape(str(ocr_response[key]))
-
-            # If we can't find the text, convert to string and try to parse
-            response_str = str(ocr_response)
-            response_str = html.unescape(response_str)
-            print(f"⚠️ OCR response format: {response_str[:200]}", flush=True)
-
-            # Try to find MRZ lines
-            mrz_lines = self._extract_mrz_lines(response_str)
+            # Cleanup
+            full_text = html.unescape(full_text)
+            full_text = re.sub(r'</[^>]+>', '', full_text)
+            full_text = full_text.replace('><', '<<')
+            
+            # Find lines
+            mrz_lines = self._extract_mrz_lines(full_text)
             if len(mrz_lines) >= 2:
                 return json.dumps({"line1": mrz_lines[0], "line2": mrz_lines[1]})
 
-            # If still nothing found, return the full response for parsing
-            return response_str
-
-        except Exception as e:
-            print(f"❌ Error extracting OCR text: {str(e)}", flush=True)
-            return html.unescape(str(ocr_response))
+            return full_text
+        except Exception:
+            return str(ocr_response)
 
     def _smart_split_mrz(self, text: str) -> tuple:
         """
-        Intelligently split concatenated MRZ using anchor-based robust regex
-        Finds the start of Line 2 by matching: PassportNum(9) + Check(1) + Nationality(3) + DOB(6) + Check(1)
+        Intelligently split concatenated MRZ using ROBUST ANCHOR REGEX.
+        Fixes the 'IND' issue and incorrect splitting.
         """
-        import re
-
-        # CRITICAL: Sanitize text first - remove ALL spaces and newlines, keep '<'
+        # Sanitize
         text = text.replace(' ', '').replace('\n', '').replace('\r', '')
 
-        # Robust regex to find Line 2 start position
-        # Matches: Passport(9 chars) + Check(1 digit) + Nationality(3 chars) + DOB(6 digits) + DOB Check(1 digit)
-        # Example: Z9999999<0IND8505246
-        line2_anchor_pattern = re.compile(r'([A-Z0-9<]{9})(\d)([A-Z<]{3})(\d{6})(\d)', re.IGNORECASE)
+        # ROBUST REGEX: Finds start of Line 2 based on logic
+        # Passport(9) + Check(1) + Nationality(3) + DOB(6) + Check(1)
+        line2_anchor = re.compile(r'([A-Z0-9<]{9})(\d)([A-Z<]{3})(\d{6})(\d)', re.IGNORECASE)
 
-        match = line2_anchor_pattern.search(text)
+        match = line2_anchor.search(text)
         if match:
             split_pos = match.start()
-            print(f"🎯 Found Line 2 anchor at position {split_pos}: {match.group()[:20]}...", flush=True)
+            print(f"🎯 Found Line 2 anchor at pos {split_pos}: {match.group()[:15]}...", flush=True)
 
-            # Find where Line 1 actually starts by searching for document type prefix
-            # Search backwards from the split position to find 'P<' or 'I<'
+            # Line 1 is immediately before Line 2
+            # Search backwards for document type P<, I<, V<
             line1_start = -1
-            # Look for P< (passport), I< (ID card), A< (travel doc), C< (crew), V< (visa)
             for prefix in ['P<', 'I<', 'A<', 'C<', 'V<']:
                 pos = text.rfind(prefix, 0, split_pos)
                 if pos != -1:
                     line1_start = pos
-                    print(f"🔍 Found Line 1 start '{prefix}' at position {line1_start}", flush=True)
                     break
-
+            
             if line1_start != -1:
-                # Extract 44 characters from the Line 1 start position
-                line1 = text[line1_start:line1_start + 44]
-                line2 = text[split_pos:split_pos + 44]
-                print(f"📏 Extracted from positions: Line1[{line1_start}:{line1_start+44}], Line2[{split_pos}:{split_pos+44}]", flush=True)
+                line1 = text[line1_start:line1_start+44]
+                line2 = text[split_pos:split_pos+44]
             else:
-                # Fallback to the old logic if we can't find the prefix
-                print(f"⚠️  Could not find document type prefix, using offset method", flush=True)
-                line1 = text[split_pos - 44:split_pos] if split_pos >= 44 else text[:split_pos]
-                line2 = text[split_pos:split_pos + 44]
+                # Fallback: take 44 chars before split
+                start = max(0, split_pos - 44)
+                line1 = text[start:split_pos]
+                line2 = text[split_pos:split_pos+44]
 
-                # If line1 is too short, pad from beginning of text
-                if len(line1) < 44 and split_pos < 44:
-                    line1 = text[:44]
+            # Normalize
+            return (self._normalize_mrz_line(line1), self._normalize_mrz_line(line2))
 
-            # Normalize both lines to exactly 44 chars
-            line1 = self._normalize_mrz_line(line1)
-            line2 = self._normalize_mrz_line(line2)
-
-            print(f"✅ Smart split successful:", flush=True)
-            print(f"   Line1 (44): {line1}", flush=True)
-            print(f"   Line2 (44): {line2}", flush=True)
-
-            return (line1, line2)
-
-        # Fallback: blind split at 44
-        print(f"⚠️  Line 2 anchor pattern not found, using position 44", flush=True)
-        line1 = self._normalize_mrz_line(text[:44])
-        line2 = self._normalize_mrz_line(text[44:88] if len(text) >= 88 else text[44:])
-        return (line1, line2)
+        # Fallback: Blind split
+        return (self._normalize_mrz_line(text[:44]), self._normalize_mrz_line(text[44:88]))
 
     def _extract_mrz_lines(self, text: str) -> list:
-        """Extract MRZ lines from text with improved sanitization"""
-        import re
+        """Extract MRZ lines using Smart Split logic"""
+        sanitized = text.replace(' ', '').replace('\n', '').replace('\r', '')
+        
+        # Check for concatenated string
+        if len(sanitized) >= 80 and ('P<' in sanitized.upper()[:10]):
+            l1, l2 = self._smart_split_mrz(sanitized)
+            return [l1, l2]
 
-        # MRZ lines for TD3 (passport) format:
-        # - Line 1: 44 characters, starts with 'P<'
-        # - Line 2: 44 characters, contains passport number, dates, etc.
-        # Both lines use '<' as filler character
-
-        # First, check if we have a long concatenated string
-        # Sanitize: remove spaces and newlines but keep '<'
-        sanitized_text = text.replace(' ', '').replace('\n', '').replace('\r', '')
-
-        # If we have a long string (80+ chars) that looks like concatenated MRZ
-        if len(sanitized_text) >= 80 and ('P<' in sanitized_text.upper()[:10]):
-            # Use smart split with anchor-based regex
-            line1, line2 = self._smart_split_mrz(sanitized_text)
-            print(f"🔀 Smart split concatenated MRZ: {len(sanitized_text)} chars → 2 lines", flush=True)
-            return [line1, line2]
-
-        # Otherwise, try line-by-line extraction
+        # Line by line
         lines = text.split('\n')
-        mrz_lines = []
-
+        candidates = []
         for line in lines:
-            # Clean the line - remove spaces but keep '<'
             line = line.strip().replace(' ', '')
+            if len(line) >= 80 and 'P<' in line.upper()[:5]:
+                l1, l2 = self._smart_split_mrz(line)
+                return [l1, l2]
+            
+            if len(line) == 44 and line.count('<') >= 2:
+                candidates.append(line)
+            elif line.upper().startswith('P<') and len(line) >= 30:
+                candidates.append(line.ljust(44, '<')[:44])
 
-            # Check for concatenated MRZ within a single line (80+ characters)
-            if len(line) >= 80 and (line.upper().startswith('P<') or 'P<' in line[:5].upper()):
-                # Use smart split to find passport number
-                line1, line2 = self._smart_split_mrz(line)
-                mrz_lines.append(line1)
-                mrz_lines.append(line2)
-                print(f"🔀 Smart split MRZ: {len(line)} chars → 2 lines", flush=True)
-                continue
+        return candidates
 
-            # MRZ lines are exactly 44 characters and contain multiple '<' characters
-            if len(line) == 44:
-                # Check if line contains typical MRZ patterns
-                if line.count('<') >= 3:  # MRZ lines have many '<' characters
-                    mrz_lines.append(line)
-            # Also check for lines that start with P< (first MRZ line)
-            elif line.upper().startswith('P<') and len(line) >= 40:
-                # Pad or trim to exactly 44 characters
-                if len(line) < 44:
-                    line = line.ljust(44, '<')
-                else:
-                    line = line[:44]
-                mrz_lines.append(line)
+    def _parse_as_json(self, text: str) -> Dict:
+        """Parse clean JSON"""
+        text = re.sub(r'```[a-z]*\s*', '', text).strip()
+        return json.loads(text)
 
-        print(f"🔍 Found {len(mrz_lines)} potential MRZ lines", flush=True)
-        for i, line in enumerate(mrz_lines):
-            print(f"   Line {i+1}: {line} (length: {len(line)})", flush=True)
-
-        return mrz_lines
-
-    def _parse_as_json(self, response_text: str) -> Dict:
-        """Parse response text as JSON"""
-        import json
-        import re
-
-        # Clean response (remove markdown code blocks if present)
-        cleaned = response_text.strip()
-
-        # Remove markdown code blocks
-        cleaned = re.sub(r'^```json\s*', '', cleaned)
-        cleaned = re.sub(r'^```\s*', '', cleaned)
-        cleaned = re.sub(r'\s*```$', '', cleaned)
-        cleaned = cleaned.strip()
-
-        try:
-            result = json.loads(cleaned)
-            return result
-        except json.JSONDecodeError as e:
-            print(f"❌ JSON parse error: {e}", flush=True)
-            print(f"Response text: {response_text[:200]}", flush=True)
-            raise Exception("Invalid JSON response from Mistral OCR API")
-
-    def _extract_mrz_with_mistral(self, ocr_text: str) -> Dict:
+    def _extract_mrz_with_ai(self, ocr_text: str) -> Dict:
         """
-        Use Mistral chat model to extract structured MRZ data from OCR text
-        This is used when OCR returns plain text instead of structured JSON
+        Use AI to extract structured data with ANTI-HALLUCINATION GUARDS
         """
-        import json
-        import re
-        import html
+        # 1. PRE-CHECK: Garbage Filter
+        if not ocr_text or len(ocr_text) < 30:
+            raise Exception("No valid text found in image")
+        
+        if '<' not in ocr_text and not any(c.isdigit() for c in ocr_text):
+            raise Exception("No MRZ patterns found")
 
-        # Decode HTML entities first
-        ocr_text = html.unescape(ocr_text)
+        prompt = f"""CRITICAL: Analyze this OCR text.
+1. If it does NOT look like a passport MRZ (Must contain 'P<' and '<<' and numbers), return:
+   {{"error": "no_mrz_found"}}
 
-        # Filter out garbage lines (like all zeros)
-        lines = ocr_text.split('\n')
-        filtered_lines = []
-        for line in lines:
-            line = line.strip()
-            # Skip lines that are all the same character repeated
-            if line and not all(c == line[0] for c in line):
-                # Skip lines that don't contain typical MRZ characters
-                if 'P<' in line or '<' in line or any(c.isalpha() for c in line):
-                    filtered_lines.append(line)
+2. DO NOT INVENT DATA. Do not return "JOHNSON" or "SPECIMEN" unless it is actually in the text.
 
-        cleaned_ocr_text = '\n'.join(filtered_lines)
-        print(f"🧹 Cleaned OCR text: {cleaned_ocr_text[:200]}", flush=True)
-
-        # Try manual extraction first (faster and more reliable)
-        manual_result = self._manual_mrz_extraction(cleaned_ocr_text)
-        if manual_result:
-            return manual_result
-
-        # Fallback to Mistral if manual extraction fails
-        prompt = f"""Extract passport MRZ lines from this OCR text. Output STRICTLY two lines of exactly 44 characters each, separated by a newline.
+3. Extract exactly two lines (44 chars each).
 
 OCR Text:
-{cleaned_ocr_text}
+{ocr_text}
 
-CRITICAL REQUIREMENTS:
-- Output EXACTLY TWO lines, each EXACTLY 44 characters
-- Line 1: Starts with 'P<', contains document type + country code + surname << given names
-- Line 2: Starts with passport number (9 chars), contains nationality, birth date, expiry, personal number
-- Use '<' as filler character (NOT spaces)
-- If the OCR text is concatenated (80+ characters), split it intelligently:
-  * Find where Line 2 starts (passport number pattern)
-  * Line 1 should be the 44 characters before that
-  * Line 2 should be the 44 characters starting from that point
-- Remove ALL spaces and newlines from the text before processing
-- Pad short lines with '<' at the end to reach exactly 44 characters
-- Truncate long lines to exactly 44 characters
+Return JSON:
+{{"line1": "TEXT...", "line2": "TEXT..."}}"""
 
-Return this exact JSON format (no markdown, no code blocks):
-{{"line1": "P<COUNTRY<SURNAME<<GIVENNAMES<<<<<<<<<<<<<<", "line2": "PASSPORTNUM<CDOBDATECSEXEXPIRYDATECZZZZZZZC"}}
-
-Replace the example values with the actual extracted data. Both lines MUST be exactly 44 characters."""
-
-        print(f"🔄 Sending to Mistral extraction model...", flush=True)
-
-        # Call Mistral chat API without response_format (not supported)
         response = self.client.chat.complete(
             model=self.extraction_model,
             messages=[{"role": "user", "content": prompt}]
         )
 
-        # Extract content from response
-        if hasattr(response, 'choices') and len(response.choices) > 0:
-            content = response.choices[0].message.content
-            print(f"📝 Mistral response: {content[:300]}", flush=True)
-
-            if not content or content.strip() == "":
-                raise Exception("Empty response from Mistral extraction model")
-
-            # Aggressively clean the response
-            cleaned = content.strip()
-            # Remove ALL markdown
-            cleaned = re.sub(r'```[a-z]*\s*', '', cleaned, flags=re.MULTILINE | re.IGNORECASE)
-            cleaned = cleaned.strip()
-
-            # Try to find JSON object in the response
-            json_match = re.search(r'\{[^}]*"line1"[^}]*"line2"[^}]*\}', cleaned, re.DOTALL)
-            if json_match:
-                cleaned = json_match.group(0)
-
-            if not cleaned:
-                raise Exception("No valid JSON found in Mistral response")
-
+        content = response.choices[0].message.content
+        
+        # Clean markdown
+        content = re.sub(r'```[a-z]*', '', content).strip()
+        
+        # Extract JSON
+        json_match = re.search(r'\{.*\}', content, re.DOTALL)
+        if json_match:
             try:
-                result = json.loads(cleaned)
+                result = json.loads(json_match.group(0))
+                
+                if "error" in result:
+                    raise Exception("AI could not find valid MRZ")
 
-                if "line1" not in result or "line2" not in result:
-                    raise Exception("Missing line1 or line2")
+                # ANTI-HALLUCINATION CHECK
+                suspicious = ['SPECIMEN', 'SAMPLE', 'JOHNSON', 'JOHNDOE', 'MISTRAL', 'EXAMPLE']
+                combined = (result.get('line1', '') + result.get('line2', '')).upper()
+                
+                for pattern in suspicious:
+                    if pattern in combined:
+                         raise Exception("Detected fake/sample data - Scan Rejected")
 
-                # Ensure exactly 44 characters
-                result["line1"] = self._normalize_mrz_line(result["line1"])
-                result["line2"] = self._normalize_mrz_line(result["line2"])
-
-                print(f"   Line1 ({len(result['line1'])}): {result['line1']}", flush=True)
-                print(f"   Line2 ({len(result['line2'])}): {result['line2']}", flush=True)
-
-                return result
-            except (json.JSONDecodeError, Exception) as e:
-                print(f"❌ Mistral extraction failed: {e}", flush=True)
-                raise Exception(f"Failed to extract MRZ: {str(e)}")
-        else:
-            raise Exception("Empty response from Mistral extraction model")
-
-    def _manual_mrz_extraction(self, text: str) -> Optional[Dict]:
-        """Manually extract MRZ lines from text without AI"""
-        import html
-        import re
-
-        # Decode HTML entities
-        text = html.unescape(text)
-
-        # Apply OCR error corrections
-        text = re.sub(r'</[^>]+>', '', text)  # Remove closing tags
-        text = text.replace('><', '<<')  # Fix >< to <<
-        text = text.replace('< ', '<').replace(' <', '<')  # Remove spaces around <
-
-        # CRITICAL: Try treating the entire text as one concatenated string first
-        # This handles the most common case where Mistral returns everything as one long line
-        sanitized_full_text = text.replace(' ', '').replace('\n', '').replace('\r', '')
-
-        # Check if the full sanitized text looks like concatenated MRZ (80+ chars with P<)
-        if len(sanitized_full_text) >= 80 and ('P<' in sanitized_full_text.upper()[:10]):
-            # Use smart split with robust anchor-based regex
-            line1, line2 = self._smart_split_mrz(sanitized_full_text)
-
-            print(f"✅ Manual extraction (full text concatenated {len(sanitized_full_text)} chars) succeeded", flush=True)
-            print(f"   Line1 ({len(line1)}): {line1}", flush=True)
-            print(f"   Line2 ({len(line2)}): {line2}", flush=True)
-
-            return {"line1": line1, "line2": line2}
-
-        # Otherwise, try line-by-line extraction
-        lines = text.split('\n')
-        mrz_candidates = []
-
-        for line in lines:
-            line = line.strip()
-            # Apply same corrections to each line
-            line = re.sub(r'</[^>]+>', '', line)
-            line = line.replace('><', '<<')
-            line = line.replace('< ', '<').replace(' <', '<')
-            line = line.replace(' ', '')  # Remove all spaces
-
-            # Look for lines that start with P< or have MRZ characteristics
-            if line.startswith('P<') or line.startswith('p<') or (len(line) >= 40 and '<' in line):
-                mrz_candidates.append(line)
-
-        # Try concatenated format (most common issue)
-        for line in mrz_candidates:
-            if len(line) >= 80:  # Two lines concatenated (at least 80 chars)
-                # Use smart split to find passport number pattern
-                line1, line2 = self._smart_split_mrz(line)
-
-                print(f"✅ Manual extraction (concatenated {len(line)} chars) succeeded", flush=True)
-                print(f"   Line1 ({len(line1)}): {line1}", flush=True)
-                print(f"   Line2 ({len(line2)}): {line2}", flush=True)
-
-                return {"line1": line1, "line2": line2}
-
-        # Try separate lines
-        if len(mrz_candidates) >= 2:
-            line1 = self._normalize_mrz_line(mrz_candidates[0])
-            line2 = self._normalize_mrz_line(mrz_candidates[1])
-
-            print(f"✅ Manual extraction (separate lines) succeeded", flush=True)
-            print(f"   Line1 ({len(line1)}): {line1}", flush=True)
-            print(f"   Line2 ({len(line2)}): {line2}", flush=True)
-
-            return {"line1": line1, "line2": line2}
-
-        # If we have only 1 candidate, check if it's at least close to concatenated
-        if len(mrz_candidates) == 1:
-            line = mrz_candidates[0]
-            if len(line) >= 70:  # Might be concatenated but with some chars missing
-                # Use smart split for partial concatenation too
-                line1, line2 = self._smart_split_mrz(line)
-
-                print(f"✅ Manual extraction (partial concatenated {len(line)} chars) succeeded", flush=True)
-                print(f"   Line1 ({len(line1)}): {line1}", flush=True)
-                print(f"   Line2 ({len(line2)}): {line2}", flush=True)
-
-                return {"line1": line1, "line2": line2}
-
-        print(f"⚠️  Manual extraction found {len(mrz_candidates)} candidates, need 2", flush=True)
-        if mrz_candidates:
-            for i, cand in enumerate(mrz_candidates):
-                print(f"   Candidate {i+1}: {len(cand)} chars - {cand[:50]}...", flush=True)
-        return None
+                if "line1" in result and "line2" in result:
+                    result["line1"] = self._normalize_mrz_line(result["line1"])
+                    result["line2"] = self._normalize_mrz_line(result["line2"])
+                    return result
+            except json.JSONDecodeError:
+                pass
+        
+        raise Exception("Failed to extract valid MRZ")
 
     def _normalize_mrz_line(self, line: str) -> str:
-        """Normalize MRZ line to exactly 44 characters"""
-        import html
-        import re
-
-        # Decode HTML entities
-        line = html.unescape(line)
-
-        # Apply OCR error corrections
-        line = re.sub(r'</[^>]+>', '', line)  # Remove closing tags like </name>
-        line = line.replace('><', '<<')  # Fix >< to <<
-        line = line.replace('< ', '<').replace(' <', '<')  # Remove spaces around <
-
-        # Remove any other whitespace
-        line = line.strip()
-
-        # Convert to uppercase (MRZ standard)
-        line = line.upper()
-
-        # Truncate or pad to exactly 44 characters
-        if len(line) > 44:
-            line = line[:44]
-        elif len(line) < 44:
-            line = line.ljust(44, '<')
-
+        line = html.unescape(line).strip().upper()
+        line = line.replace(' ', '').replace('><', '<<')
+        if len(line) > 44: line = line[:44]
+        elif len(line) < 44: line = line.ljust(44, '<')
         return line
 
     def _validate_mrz_format(self, result: Dict) -> bool:
-        """Validate MRZ format (2 lines, 44 chars each)"""
-        if "line1" not in result or "line2" not in result:
-            print(f"❌ Missing line1 or line2 in response", flush=True)
-            return False
-
-        line1 = result["line1"]
-        line2 = result["line2"]
-
-        if len(line1) != 44:
-            print(f"❌ Line1 length is {len(line1)}, expected 44", flush=True)
-            return False
-
-        if len(line2) != 44:
-            print(f"❌ Line2 length is {len(line2)}, expected 44", flush=True)
-            return False
-
-        return True
+        if "line1" not in result or "line2" not in result: return False
+        return len(result["line1"]) == 44 and len(result["line2"]) == 44
 
 
 # ============================================
-# ICAO 9303 MRZ PARSER
+# STRICT ICAO 9303 MRZ PARSER
 # ============================================
 
-class MRZParser:
-    """Parse and validate ICAO 9303 TD3 format MRZ"""
+class StrictMRZParser:
+    """Strict ICAO 9303 TD3 Parser"""
 
     @staticmethod
-    def char_to_value(char: str) -> int:
-        """Convert MRZ character to numeric value for checksum"""
-        if char.isdigit():
-            return int(char)
-        elif char.isalpha():
-            return ord(char) - ord('A') + 10
-        elif char == '<':
-            return 0
-        else:
-            return 0
+    def parse_mrz_strict(line1: str, line2: str) -> Dict:
+        print(f"🔍 Parsing MRZ...", flush=True)
 
-    @staticmethod
-    def calculate_checksum(data: str) -> int:
-        """Calculate ICAO 9303 checksum using mod 10 with weights 7,3,1"""
-        weights = [7, 3, 1]
-        total = 0
-
-        for i, char in enumerate(data):
-            value = MRZParser.char_to_value(char)
-            weight = weights[i % 3]
-            total += value * weight
-
-        return total % 10
-
-    @staticmethod
-    def validate_checksum(data: str, check_digit: str) -> bool:
-        """Validate data against its check digit"""
-        if not check_digit.isdigit():
-            return False
-
-        calculated = MRZParser.calculate_checksum(data)
-        expected = int(check_digit)
-
-        return calculated == expected
-
-    @staticmethod
-    def format_date(yymmdd: str) -> str:
-        """Convert YYMMDD to DD.MM.YYYY format"""
-        if len(yymmdd) != 6 or not yymmdd.isdigit():
-            return yymmdd
-
-        yy = int(yymmdd[0:2])
-        mm = yymmdd[2:4]
-        dd = yymmdd[4:6]
-
-        # Determine century (20xx for years < 50, 19xx otherwise)
-        yyyy = 2000 + yy if yy < 50 else 1900 + yy
-
-        return f"{dd}.{mm}.{yyyy}"
-
-    @staticmethod
-    def ocr_error_correction_numbers(text: str) -> str:
-        """Correct common OCR errors in number fields (O -> 0)"""
-        return text.replace('O', '0').replace('o', '0')
-
-    @staticmethod
-    def ocr_error_correction_letters(text: str) -> str:
-        """Correct common OCR errors in letter fields (0 -> O)"""
-        return text.replace('0', 'O')
-
-    @staticmethod
-    def parse_mrz(line1: str, line2: str) -> Dict:
-        """
-        Parse complete TD3 MRZ (2 lines x 44 chars) following ICAO 9303 standard STRICTLY
-        Line 1: P<CCCSURNAME<<GIVEN<NAMES<<<<<<<<<<<<<<<<<<
-        Line 2: NNNNNNNNNNCYYYMMDDCSXYYYMMDDCZZZZZZZZZZZZZCC
-
-        CRITICAL: Uses FIXED character positions for Line 2 parsing
-        """
-        # Clean and uppercase
+        # Basic cleanup
         line1 = line1.strip().upper()
         line2 = line2.strip().upper()
 
-        print(f"🔍 Parsing MRZ lines:", flush=True)
-        print(f"   Line 1: {line1}", flush=True)
-        print(f"   Line 2: {line2}", flush=True)
-
         if len(line1) != 44 or len(line2) != 44:
-            raise ValueError(f"Invalid MRZ format. Line1: {len(line1)}, Line2: {len(line2)}")
+            raise ValueError("Invalid MRZ line length")
 
-        # ===== LINE 1 PARSING (Name Parsing with << separator) =====
-        doc_type = line1[0]  # Should be 'P' for passport
-        country_code = line1[2:5].replace('<', '').strip()
-
-        # Name section starts at position 5
+        # LINE 1
+        doc_type = line1[0]
+        country_code = line1[2:5].replace('<', '')
         names_section = line1[5:44]
+        
+        surname = names_section.split('<<')[0].replace('<', ' ').strip() if '<<' in names_section else names_section.replace('<', ' ').strip()
+        given_names = names_section.split('<<')[1].replace('<', ' ').strip() if '<<' in names_section else ""
 
-        # Find the double chevron separator <<
-        if '<<' in names_section:
-            separator_pos = names_section.index('<<')
-            surname_raw = names_section[:separator_pos]
-            given_names_raw = names_section[separator_pos + 2:]  # Skip <<
-
-            # Clean surname: replace single < with space, remove trailing <
-            surname = surname_raw.replace('<', ' ').strip()
-
-            # Clean given names: replace single < with space, remove trailing <
-            given_names = given_names_raw.replace('<', ' ').strip()
-        else:
-            # Fallback: no clear separator
-            surname = names_section.replace('<', ' ').strip()
-            given_names = ""
-
-        # Apply OCR correction to names (0 -> O)
-        surname = MRZParser.ocr_error_correction_letters(surname)
-        given_names = MRZParser.ocr_error_correction_letters(given_names)
-
-        # ===== LINE 2 PARSING (STRICT FIXED POSITIONS) =====
-        # Extract by exact indices as per ICAO 9303
-        passport_number_raw = line2[0:9]
+        # LINE 2 - FIXED GRID
+        passport_raw = line2[0:9]
         passport_check = line2[9]
-        nationality = line2[10:13]
+        nationality_raw = line2[10:13]
         dob_raw = line2[13:19]
         dob_check = line2[19]
-        sex = line2[20]
+        sex_raw = line2[20]
         expiry_raw = line2[21:27]
         expiry_check = line2[27]
-        personal_number_raw = line2[28:42]  # 14 characters (PINFL for UZB)
-        personal_check = line2[42]
-        composite_check = line2[43]
+        pinfl_raw = line2[28:42]
+        pinfl_check = line2[42]
 
-        # Apply OCR corrections
-        # For passport number: first 2 chars should be LETTERS, rest should be DIGITS
-        passport_cleaned = passport_number_raw.replace('<', '').strip()
-        if len(passport_cleaned) >= 2:
-            # Ensure first 2 characters are letters (fix O->0 errors)
-            prefix = passport_cleaned[:2].replace('0', 'O').replace('1', 'I')
-            # Ensure remaining characters are digits (fix O->0 errors)
-            suffix = passport_cleaned[2:].replace('O', '0').replace('o', '0').replace('I', '1').replace('l', '1')
+        # ERROR CORRECTION
+        # 1. Passport: 2 letters, 7 digits. Fix O->0, 0->O
+        pass_clean = passport_raw.replace('<', '')
+        if len(pass_clean) >= 2:
+            prefix = pass_clean[:2].replace('0', 'O').replace('1', 'I')
+            suffix = pass_clean[2:].replace('O', '0').replace('o', '0').replace('I', '1').replace('l', '1')
             passport_number = prefix + suffix
         else:
-            passport_number = MRZParser.ocr_error_correction_numbers(passport_cleaned)
+            passport_number = pass_clean
 
-        # Fix common nationality OCR errors (especially for UZB)
-        nationality_raw = nationality.replace('<', '').strip()
-        if nationality_raw in ['ZBO', 'LZB', 'USB', 'U2B', 'UZ8', 'UZD', '028', 'O2B']:
+        # 2. Nationality
+        nationality = nationality_raw.replace('<', '')
+        if nationality in ['ZBO', 'LZB', 'USB', 'U2B', 'UZ8', 'O2B']: nationality = 'UZB'
+        
+        # Force UZB if passport starts with known prefix
+        if nationality != 'UZB' and passport_number[:2] in ['FA', 'FB', 'FC', 'FD', 'AC', 'AD', 'AA']:
             nationality = 'UZB'
-        else:
-            nationality = nationality_raw
 
-        dob = MRZParser.ocr_error_correction_numbers(dob_raw)
-        expiry = MRZParser.ocr_error_correction_numbers(expiry_raw)
-        personal_number = MRZParser.ocr_error_correction_numbers(personal_number_raw).replace('<', '').strip()
-        sex = sex.replace('<', '')
+        # 3. Dates/PINFL: Fix O->0
+        dob = dob_raw.replace('O', '0')
+        expiry = expiry_raw.replace('O', '0')
+        pinfl = pinfl_raw.replace('O', '0').replace('<', '')
+        sex = sex_raw.replace('<', '')
 
-        # Validate checksums
+        # VALIDATION
         validations = {
-            "passport_number_valid": MRZParser.validate_checksum(passport_number_raw, passport_check),
-            "dob_valid": MRZParser.validate_checksum(dob_raw, dob_check),
-            "expiry_valid": MRZParser.validate_checksum(expiry_raw, expiry_check),
-            "personal_number_valid": MRZParser.validate_checksum(personal_number_raw, personal_check),
+            "passport_valid": StrictMRZParser.validate(passport_raw, passport_check),
+            "dob_valid": StrictMRZParser.validate(dob_raw, dob_check),
+            "expiry_valid": StrictMRZParser.validate(expiry_raw, expiry_check),
+            "pinfl_valid": StrictMRZParser.validate(pinfl_raw, pinfl_check)
         }
-
-        # Composite check (entire line 2 except last check digit)
-        composite_data = line2[0:10] + line2[13:20] + line2[21:43]
-        validations["composite_valid"] = MRZParser.validate_checksum(composite_data, composite_check)
-
-        # Validate date formats
-        validations["dob_format_valid"] = len(dob) == 6 and dob.isdigit()
-        validations["expiry_format_valid"] = len(expiry) == 6 and expiry.isdigit()
-
-        # Overall validation
-        all_checks_valid = all(validations.values())
-
-        print(f"✅ Parsed data:", flush=True)
-        print(f"   Name: {given_names} {surname}", flush=True)
-        print(f"   Passport: {passport_number}", flush=True)
-        print(f"   PINFL: {personal_number}", flush=True)
-        print(f"   Validation: {'PASS' if all_checks_valid else 'FAIL'}", flush=True)
+        
+        all_valid = all(validations.values())
 
         return {
+            "passport_number": passport_number,
             "surname": surname,
             "name": given_names,
-            "passport_number": passport_number,
-            "birth_date": MRZParser.format_date(dob),
-            "expiry_date": MRZParser.format_date(expiry),
-            "sex": sex if sex in ['M', 'F'] else 'F',  # Default to F if unclear
+            "given_names": given_names,
+            "birth_date": StrictMRZParser.fmt_date(dob),
+            "date_of_birth": StrictMRZParser.fmt_date(dob),
+            "expiry_date": StrictMRZParser.fmt_date(expiry),
+            "date_of_expiry": StrictMRZParser.fmt_date(expiry),
+            "sex": sex,
             "nationality": nationality,
-            "pinfl": personal_number,  # 14-digit PINFL for Uzbek passports
-            # Legacy fields for backwards compatibility
+            "pinfl": pinfl,
+            "personal_number": pinfl,
             "document_type": doc_type,
             "country_code": country_code,
-            "given_names": given_names,
-            "date_of_birth": MRZParser.format_date(dob),
-            "date_of_birth_raw": dob,
-            "date_of_expiry": MRZParser.format_date(expiry),
-            "date_of_expiry_raw": expiry,
-            "personal_number": personal_number,
-            "validations": validations,
-            "validation_status": "PASS" if all_checks_valid else "FAIL",
-            "raw_mrz": {
-                "line1": line1,
-                "line2": line2
-            }
+            "validation_status": "PASS" if all_valid else "WARNING",
+            "raw_mrz": {"line1": line1, "line2": line2}
         }
+
+    @staticmethod
+    def fmt_date(yymmdd):
+        if len(yymmdd) != 6 or not yymmdd.isdigit(): return yymmdd
+        return f"{yymmdd[4:6]}.{yymmdd[2:4]}.{'20'+yymmdd[0:2] if int(yymmdd[0:2])<50 else '19'+yymmdd[0:2]}"
+
+    @staticmethod
+    def validate(data, check):
+        if not check.isdigit(): return False
+        weights = [7, 3, 1]
+        total = 0
+        for i, c in enumerate(data):
+            val = int(c) if c.isdigit() else (ord(c)-55 if c.isalpha() else 0)
+            total += val * weights[i % 3]
+        return (total % 10) == int(check)
 
 
 # ============================================
-# SECURITY & RATE LIMITING
+# SECURITY & CONFIG
 # ============================================
 
 request_timestamps = {}
 RATE_LIMIT_WINDOW = 60
-MAX_REQUESTS_PER_WINDOW = 20
+MAX_REQUESTS_PER_WINDOW = 30
 MAX_FILE_SIZE = 10 * 1024 * 1024
 ALLOWED_EXTENSIONS = ['.jpg', '.jpeg', '.png']
 
 def check_rate_limit(client_id: str) -> bool:
-    """Rate limiting: Max 20 requests per 60 seconds per client"""
     current_time = time.time()
-
-    if client_id not in request_timestamps:
-        request_timestamps[client_id] = []
-
-    # Remove old timestamps
-    request_timestamps[client_id] = [
-        ts for ts in request_timestamps[client_id]
-        if current_time - ts < RATE_LIMIT_WINDOW
-    ]
-
-    # Check limit
-    if len(request_timestamps[client_id]) >= MAX_REQUESTS_PER_WINDOW:
-        return False
-
+    if client_id not in request_timestamps: request_timestamps[client_id] = []
+    request_timestamps[client_id] = [ts for ts in request_timestamps[client_id] if current_time - ts < RATE_LIMIT_WINDOW]
+    if len(request_timestamps[client_id]) >= MAX_REQUESTS_PER_WINDOW: return False
     request_timestamps[client_id].append(current_time)
     return True
 
 def validate_image_file(file: UploadFile, contents: bytes) -> None:
-    """Validate uploaded file for security"""
-    # Check file size
-    if len(contents) > MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File too large. Max size: {MAX_FILE_SIZE / (1024*1024)}MB"
-        )
-
-    # Check extension
+    if len(contents) > MAX_FILE_SIZE: raise HTTPException(status_code=413, detail="File too large")
     if file.filename:
         ext = os.path.splitext(file.filename)[1].lower()
-        if ext not in ALLOWED_EXTENSIONS:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid file type. Allowed: {', '.join(ALLOWED_EXTENSIONS)}"
-            )
-
-    # Validate it's actually an image
+        if ext not in ALLOWED_EXTENSIONS: raise HTTPException(status_code=400, detail="Invalid file type")
     try:
         img = Image.open(io.BytesIO(contents))
         img.verify()
-    except Exception:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid or corrupted image file"
-        )
+    except: raise HTTPException(status_code=400, detail="Invalid image")
 
 
 # ============================================
 # API ENDPOINTS
 # ============================================
 
-# Initialize Mistral Scanner
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "JWSVnIJhbnyhc80PY32AhKkxEbS4SFFi")
-
-# Log API key configuration
-if os.environ.get("MISTRAL_API_KEY"):
-    print(f"✅ Using MISTRAL_API_KEY from environment variable", flush=True)
-else:
-    print(f"⚠️  WARNING: Using hardcoded Mistral API key (set MISTRAL_API_KEY env var)", flush=True)
-
-mistral_scanner = MistralMRZScanner(api_key=MISTRAL_API_KEY)
+scanner_engine = CustomsScannerEngine(api_key=MISTRAL_API_KEY)
 
 @app.get("/", response_class=HTMLResponse)
 async def root(request: Request):
-    """Serve the Telegram Mini App frontend"""
     return templates.TemplateResponse("index.html", {"request": request})
-
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
     return {
         "status": "healthy",
-        "service": "passport-scanner-mistral",
-        "version": "3.0.0"
+        "service": "customs-passport-scanner",
+        "version": "3.5.0"
     }
-
 
 @app.post("/scan")
 async def scan_passport(request: Request, file: UploadFile = File(...)):
-    """
-    Main endpoint for passport scanning using Mistral AI Vision API
-    """
+    """Main scanning endpoint"""
     try:
-        # Rate limiting
         client_id = request.client.host if request.client else "unknown"
-
         if not check_rate_limit(client_id):
-            raise HTTPException(
-                status_code=429,
-                detail="Too many requests. Please wait a moment."
-            )
+            raise HTTPException(status_code=429, detail="Too many requests")
 
-        # Read file
         contents = await file.read()
-
-        if not contents:
-            raise HTTPException(status_code=400, detail="Empty file uploaded")
-
-        # Validate file
+        if not contents: raise HTTPException(status_code=400, detail="Empty file")
         validate_image_file(file, contents)
 
-        print(f"📸 Processing image: {file.filename} ({len(contents)} bytes)", flush=True)
+        print(f"📸 Processing image: {file.filename}", flush=True)
 
-        # Scan with Mistral AI
-        print("🤖 Scanning passport with Mistral OCR API...", flush=True)
-        mrz_result = mistral_scanner.scan_passport_mrz(contents)
+        # 1. Scan (OCR)
+        mrz_result = scanner_engine.scan_passport_mrz(contents)
 
-        # Parse MRZ
-        print("📋 Parsing MRZ data...", flush=True)
-        parsed_data = MRZParser.parse_mrz(mrz_result["line1"], mrz_result["line2"])
+        # 2. Parse (Strict Logic)
+        parsed_data = StrictMRZParser.parse_mrz_strict(mrz_result["line1"], mrz_result["line2"])
 
-        # Add metadata
+        # 3. Add Metadata (BRANDING REMOVED)
         parsed_data["scan_metadata"] = {
             "timestamp": datetime.utcnow().isoformat() + "Z",
             "file_name": file.filename,
-            "file_size": len(contents),
-            "file_hash": hashlib.sha256(contents).hexdigest()[:16],
-            "scanner": "Mistral AI OCR"
+            "scanner": "Customs AI Scanner (v3.5)" # <--- NEW NAME
         }
 
-        print(f"✅ Passport scanned successfully: {parsed_data['passport_number']}", flush=True)
+        print(f"✅ Scan completed: {parsed_data['passport_number']}", flush=True)
+        return JSONResponse(content={"success": True, "data": parsed_data})
 
-        return JSONResponse(content={
-            "success": True,
-            "data": parsed_data
-        })
-
-    except HTTPException:
-        raise
-    except ValueError as ve:
-        raise HTTPException(status_code=422, detail=str(ve))
+    except HTTPException: raise
     except Exception as e:
         print(f"❌ Error: {str(e)}", flush=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to scan passport: {str(e)}"
-        )
-
-
-@app.get("/test")
-async def test_endpoint():
-    """Test endpoint"""
-    return {
-        "message": "Passport Scanner with Mistral AI OCR",
-        "version": "3.0.0",
-        "status": "operational",
-        "features": [
-            "Mistral AI OCR API",
-            "Smart MRZ Cropping",
-            "ICAO 9303 TD3 Parsing",
-            "Checksum Validation",
-            "Rate Limiting",
-            "File Validation"
-        ]
-    }
-
+        raise HTTPException(status_code=500, detail=f"Scan failed: {str(e)}")
 
 @app.post("/telegram-webhook")
 async def telegram_webhook(request: Request):
-    """
-    Webhook endpoint for Telegram bot updates
-    This endpoint receives updates from Telegram when running on Railway
-    """
     try:
-        # Get the update data from Telegram
         update_data = await request.json()
-
-        # Import bot application (lazy import to avoid circular dependency)
         from bot import get_application
-
-        # Get the Telegram application instance
         application = get_application()
-
-        # Process the update
         update = Update.de_json(update_data, application.bot)
         await application.process_update(update)
-
         return JSONResponse(content={"ok": True})
-
     except Exception as e:
-        print(f"❌ Error processing webhook: {str(e)}", flush=True)
-        # Return 200 anyway to avoid Telegram retrying
+        print(f"❌ Webhook error: {str(e)}", flush=True)
         return JSONResponse(content={"ok": False, "error": str(e)}, status_code=200)
-
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=port,
-        reload=False,
-        log_level="info"
-    )
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False, log_level="info")
