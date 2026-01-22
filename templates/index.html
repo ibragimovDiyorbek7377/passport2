@@ -441,10 +441,6 @@
             <button class="btn btn-primary" id="capture-btn">
                 📷 Rasmga Olish
             </button>
-            <button class="btn btn-secondary" id="upload-btn">
-                📁 Galereyadan Yuklash
-            </button>
-            <input type="file" id="file-input" accept="image/*" style="display: none;">
             <button class="btn btn-secondary" id="retake-btn" style="display: none;">
                 🔄 Qayta Olish
             </button>
@@ -488,8 +484,6 @@
         const cameraStream = document.getElementById('camera-stream');
         const canvasPreview = document.getElementById('canvas-preview');
         const captureBtn = document.getElementById('capture-btn');
-        const uploadBtn = document.getElementById('upload-btn');
-        const fileInput = document.getElementById('file-input');
         const retakeBtn = document.getElementById('retake-btn');
         const passportGuide = document.getElementById('passport-guide');
         const loading = document.getElementById('loading');
@@ -528,12 +522,12 @@
                 console.warn('⚠️ Camera initialization failed:', error);
                 cameraAvailable = false;
 
-                // Hide camera controls, show upload only
+                // Hide camera controls
                 cameraStream.style.display = 'none';
                 captureBtn.style.display = 'none';
                 passportGuide.style.display = 'none';
 
-                showError('📱 Kamera ishlamayapti.\n\nIltimos, "Galereyadan Yuklash" tugmasini ishlating.');
+                showError('📱 Kamera ishlamayapti.\n\nIltimos, kamera ruxsatini yoqing yoki boshqa qurilmada sinab ko\'ring.');
             }
         }
 
@@ -672,7 +666,6 @@
                 // Show retake options
                 setTimeout(() => {
                     retakeBtn.style.display = 'block';
-                    uploadBtn.style.display = 'block';
                     if (cameraAvailable) {
                         captureBtn.style.display = 'none';
                     }
@@ -769,9 +762,6 @@
             resultsSection.classList.remove('show');
             hideError();
 
-            // Reset file input
-            fileInput.value = '';
-
             // If camera is available, show it
             if (cameraAvailable) {
                 cameraStream.style.display = 'block';
@@ -779,13 +769,10 @@
                 passportGuide.style.display = 'block';
                 initCamera();
             } else {
-                // Camera not available, just show upload button
+                // Camera not available
                 captureBtn.style.display = 'none';
                 passportGuide.style.display = 'none';
             }
-
-            // Always show upload button
-            uploadBtn.style.display = 'block';
         }
 
         // Show/hide error
@@ -806,109 +793,9 @@
             }
         }
 
-        // Handle file upload from gallery (with MRZ cropping)
-        function handleFileUpload(event) {
-            const file = event.target.files[0];
-
-            if (!file) {
-                return;
-            }
-
-            // Validate file type
-            if (!file.type.startsWith('image/')) {
-                showError('❌ Iltimos, faqat rasm faylini yuklang (JPG, PNG)');
-                return;
-            }
-
-            // Validate file size (max 10MB)
-            if (file.size > 10 * 1024 * 1024) {
-                showError('❌ Rasm hajmi juda katta. Maksimal hajm: 10MB');
-                return;
-            }
-
-            console.log(`📁 File selected: ${file.name} (${(file.size/1024).toFixed(1)}KB)`);
-
-            // Read file and display preview
-            const reader = new FileReader();
-            reader.onload = function(e) {
-                const img = new Image();
-                img.onload = function() {
-                    // Create full canvas
-                    const fullCanvas = document.createElement('canvas');
-                    fullCanvas.width = img.width;
-                    fullCanvas.height = img.height;
-                    const fullCtx = fullCanvas.getContext('2d');
-                    fullCtx.drawImage(img, 0, 0);
-
-                    // Crop MRZ area (bottom 18% of image, centered 90% width)
-                    const cropHeight = fullCanvas.height * 0.18;
-                    const cropWidth = fullCanvas.width * 0.90;
-                    const cropX = (fullCanvas.width - cropWidth) / 2;
-                    const cropY = fullCanvas.height * (1 - 0.15 - 0.18);
-
-                    const croppedCanvas = document.createElement('canvas');
-                    croppedCanvas.width = cropWidth;
-                    croppedCanvas.height = cropHeight;
-                    const croppedCtx = croppedCanvas.getContext('2d');
-                    croppedCtx.drawImage(
-                        fullCanvas,
-                        cropX, cropY, cropWidth, cropHeight,
-                        0, 0, cropWidth, cropHeight
-                    );
-
-                    // Resize to width ~1000px for speed
-                    const maxWidth = 1000;
-                    let finalCanvas = croppedCanvas;
-
-                    if (croppedCanvas.width > maxWidth) {
-                        const scale = maxWidth / croppedCanvas.width;
-                        finalCanvas = document.createElement('canvas');
-                        finalCanvas.width = maxWidth;
-                        finalCanvas.height = croppedCanvas.height * scale;
-                        const finalCtx = finalCanvas.getContext('2d');
-
-                        finalCtx.imageSmoothingEnabled = true;
-                        finalCtx.imageSmoothingQuality = 'high';
-                        finalCtx.drawImage(croppedCanvas, 0, 0, finalCanvas.width, finalCanvas.height);
-                    }
-
-                    // Show preview (cropped MRZ)
-                    canvasPreview.width = finalCanvas.width;
-                    canvasPreview.height = finalCanvas.height;
-                    canvasPreview.getContext('2d').drawImage(finalCanvas, 0, 0);
-
-                    // Hide camera, show preview
-                    if (cameraAvailable) {
-                        stopCamera();
-                        cameraStream.style.display = 'none';
-                    }
-                    canvasPreview.style.display = 'block';
-                    captureBtn.style.display = 'none';
-                    uploadBtn.style.display = 'none';
-                    retakeBtn.style.display = 'block';
-                    passportGuide.classList.add('scanning');
-
-                    // Convert to blob and scan
-                    finalCanvas.toBlob(async (blob) => {
-                        capturedImageBlob = blob;
-                        console.log(`✅ MRZ cropped from gallery: ${finalCanvas.width}x${finalCanvas.height}, Size: ${(blob.size/1024).toFixed(1)}KB`);
-                        await scanPassport(blob);
-                    }, 'image/jpeg', 0.95);
-                };
-                img.src = e.target.result;
-            };
-            reader.readAsDataURL(file);
-        }
-
-        // Trigger file input click
-        function openFileUpload() {
-            fileInput.click();
-        }
 
         // Event listeners
         captureBtn.addEventListener('click', capturePhoto);
-        uploadBtn.addEventListener('click', openFileUpload);
-        fileInput.addEventListener('change', handleFileUpload);
         retakeBtn.addEventListener('click', retakePhoto);
         scanAnotherBtn.addEventListener('click', retakePhoto);
 
