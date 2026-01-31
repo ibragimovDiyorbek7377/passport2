@@ -43,7 +43,7 @@ import cv2
 
 class Config:
     """Tizim sozlamalari"""
-    VERSION = "2.1.0"
+    VERSION = "2.2.0"
     SERVICE_NAME = "Bojxona Passport Scanner (Lokal)"
 
     # Xavfsizlik
@@ -506,6 +506,9 @@ class ICAO9303Parser:
         if len(line1) != 44 or len(line2) != 44:
             raise ValueError(f"MRZ uzunligi noto'g'ri: L1={len(line1)}, L2={len(line2)}")
 
+        # Line2 preprocessing - filler belgilarini tiklash
+        line2 = cls._preprocess_line2(line2)
+
         # ==========================================
         # LINE 1 PARSING
         # ==========================================
@@ -602,6 +605,55 @@ class ICAO9303Parser:
     # ==========================================
 
     @classmethod
+    def _preprocess_line2(cls, line2: str) -> str:
+        """
+        Line2 preprocessing - OCR xatolarini tuzatish.
+        Asosiy muammo: '<' belgisi '0' deb o'qiladi.
+
+        O'zbekiston pasport Line2 formati:
+        FB0292047<0UZB031225<M291018<3525120374400<<<<0
+        [passport][c][nat][dob  ][c][s][expiry][c][pinfl        ][c][comp]
+
+        Pozitsiyalar (0-indexed):
+        0-8:   Passport number (9 belgi)
+        9:     Check digit
+        10-12: Nationality (3 belgi)
+        13-18: DOB (6 raqam)
+        19:    DOB check digit
+        20:    Sex (M/F)
+        21-26: Expiry (6 raqam)
+        27:    Expiry check digit
+        28-41: Personal number / PINFL (14 belgi)
+        42:    Personal number check digit
+        43:    Composite check digit
+        """
+        if len(line2) != 44:
+            return line2
+
+        # Line2 ni list ga aylantirish (o'zgartirish uchun)
+        chars = list(line2)
+
+        # Pozitsiya 20 - Jins (M yoki F bo'lishi kerak)
+        sex_char = chars[20]
+        if sex_char not in ('M', 'F', '<'):
+            # OCR xatolari: N->M, W->M, H->M
+            if sex_char in ('N', 'W', 'H', 'K', '0'):
+                chars[20] = 'M'
+            elif sex_char in ('E', 'P'):
+                chars[20] = 'F'
+
+        # Oxirgi 4 belgi ko'pincha filler (<<<<)
+        # Agar '0000' bo'lsa, '<<<0' ga o'zgartirish
+        if ''.join(chars[40:44]) == '0000':
+            chars[40:43] = ['<', '<', '<']
+
+        # Agar oxirgi 5 belgi '00000' bo'lsa
+        if ''.join(chars[39:44]) == '00000':
+            chars[39:43] = ['<', '<', '<', '<']
+
+        return ''.join(chars)
+
+    @classmethod
     def _parse_names(cls, names_section: str) -> Tuple[str, str]:
         """Familiya va ismni ajratish"""
         if '<<' in names_section:
@@ -629,22 +681,34 @@ class ICAO9303Parser:
 
     @classmethod
     def _fix_nationality(cls, raw: str, passport_number: str) -> str:
-        """Nationality ni tuzatish"""
-        nationality = raw.replace('<', '')
+        """Nationality ni tuzatish - kengaytirilgan OCR xatolari"""
+        nationality = raw.replace('<', '').replace('0', 'O')
 
-        # OCR xatolarini tuzatish
+        # OCR xatolarini tuzatish - kengaytirilgan ro'yxat
         fixes = {
+            # UZB variantlari
             'ZBO': 'UZB', 'LZB': 'UZB', 'USB': 'UZB',
             'U2B': 'UZB', 'UZ8': 'UZB', 'O2B': 'UZB',
-            'UZ0': 'UZB', '0ZB': 'UZB'
+            'UZ0': 'UZB', '0ZB': 'UZB', 'UZO': 'UZB',
+            'U28': 'UZB', 'OZB': 'UZB', 'UZ6': 'UZB',
+            '0Z8': 'UZB', '028': 'UZB', 'OZ8': 'UZB',
+            'U7B': 'UZB', '07B': 'UZB', 'O7B': 'UZB',
+            '7B0': 'UZB', '7BO': 'UZB', 'TBI': 'UZB',
+            # Raqamli variantlar
+            '007': 'UZB', '070': 'UZB', '700': 'UZB',
         }
         nationality = fixes.get(nationality, nationality)
 
-        # O'zbekiston pasporti prefiksini tekshirish
-        if passport_number[:2] in cls.UZB_PREFIXES and nationality != 'UZB':
-            nationality = 'UZB'
+        # O'zbekiston pasporti prefiksini tekshirish - har doim UZB
+        if len(passport_number) >= 2 and passport_number[:2] in cls.UZB_PREFIXES:
+            return 'UZB'
 
-        return nationality
+        # Agar hali ham noto'g'ri bo'lsa va O'zbekiston prefiksi bo'lsa
+        if not nationality.isalpha() or len(nationality) != 3:
+            if len(passport_number) >= 2 and passport_number[:2] in cls.UZB_PREFIXES:
+                return 'UZB'
+
+        return nationality if nationality else 'UZB'
 
     @classmethod
     def _fix_digits(cls, raw: str) -> str:
@@ -653,11 +717,17 @@ class ICAO9303Parser:
 
     @classmethod
     def _fix_sex(cls, raw: str) -> str:
-        """Jinsni tuzatish"""
+        """Jinsni tuzatish - OCR xatolarini hisobga olish"""
         raw = raw.upper()
         if raw in ('M', 'F'):
             return raw
-        return 'X'
+        # OCR xatolari: N->M, W->M, H->M
+        if raw in ('N', 'W', 'H', 'K'):
+            return 'M'
+        # OCR xatolari: E->F, P->F
+        if raw in ('E', 'P'):
+            return 'F'
+        return 'M'  # Default erkak (O'zbekiston pasportlari uchun ko'p holat)
 
     @classmethod
     def _format_date(cls, yymmdd: str) -> str:
