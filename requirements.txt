@@ -7,11 +7,15 @@ jinja2==3.1.3
 # Telegram Bot (v22.5 supports httpx>=0.27)
 python-telegram-bot>=22.0
 
-# Mistral AI Vision API
-mistralai>=1.0.0
-
 # Image Processing
 Pillow==10.2.0
+numpy>=1.24.0
+
+# OCR - Tesseract (100% Lokal)
+pytesseract>=0.3.10
+
+# OpenCV - Rasm preprocessing
+opencv-python-headless>=4.8.0
 
 # Utilities
 python-dateutil>=2.9.0
