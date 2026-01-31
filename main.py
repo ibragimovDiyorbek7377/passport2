@@ -43,7 +43,7 @@ import cv2
 
 class Config:
     """Tizim sozlamalari"""
-    VERSION = "2.3.0"
+    VERSION = "2.2.0"
     SERVICE_NAME = "Bojxona Passport Scanner (Lokal)"
 
     # Xavfsizlik
@@ -112,19 +112,16 @@ class SecurityModule:
 
 class MRZDetector:
     """
-    MRZ zonasini ANIQ topish va OCR uchun tayyorlash.
-
-    Asosiy tamoyil:
-    1. MRZ zonasini topish (pastki qism, 2 qator)
-    2. Faqat MRZ ni kesib olish
-    3. OQ MATN - QORA FON qilish (Tesseract yaxshi o'qiydi)
-    4. Kattalashtirish (DPI oshirish)
+    MRZ zonasini topish va OCR uchun tayyorlash.
+    Bir nechta usul bilan sinab ko'radi.
     """
 
     @staticmethod
     def detect_and_extract(image_bytes: bytes) -> List[np.ndarray]:
-        """MRZ zonasini topish va OCR uchun tayyorlash"""
-
+        """
+        MRZ zonasini topish va bir nechta variant qaytarish.
+        Har bir variant boshqa preprocessing bilan.
+        """
         # PIL dan numpy array ga
         pil_image = Image.open(io.BytesIO(image_bytes))
 
@@ -140,178 +137,150 @@ class MRZDetector:
         img_array = np.array(pil_image)
         gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
 
+        # Rasmni kattalashtirish (agar kichik bo'lsa)
         height, width = gray.shape
-        print(f"   Rasm o'lchami: {width}x{height}", flush=True)
+        if width < 1200:
+            scale = 1200 / width
+            gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            height, width = gray.shape
 
         candidates = []
 
         # ==========================================
-        # USUL 1: Aniq MRZ zonasini topish
+        # USUL 1: Morphological MRZ Detection
         # ==========================================
         try:
-            mrz_binary = MRZDetector._find_mrz_zone(gray)
-            if mrz_binary is not None:
-                candidates.append(mrz_binary)
-                print(f"   ✓ MRZ zonasi topildi (morphological)", flush=True)
+            mrz_region = MRZDetector._detect_mrz_morphological(gray)
+            if mrz_region is not None:
+                candidates.append(mrz_region)
         except Exception as e:
-            print(f"   Morphological xato: {e}", flush=True)
+            print(f"   Morphological detection xatosi: {e}", flush=True)
 
         # ==========================================
-        # USUL 2: Pastki 20% - eng yaxshi kesish
+        # USUL 2: Pastki 30% ni kesish (klassik)
         # ==========================================
-        mrz_crop = MRZDetector._crop_bottom(gray, 0.20)
-        candidates.append(MRZDetector._make_binary_for_ocr(mrz_crop))
+        mrz_height = int(height * 0.30)
+        bottom_region = gray[height - mrz_height:, :]
+        candidates.append(MRZDetector._preprocess_for_ocr(bottom_region))
 
         # ==========================================
-        # USUL 3: Pastki 25%
+        # USUL 3: Pastki 25% - boshqa preprocessing
         # ==========================================
-        mrz_crop = MRZDetector._crop_bottom(gray, 0.25)
-        candidates.append(MRZDetector._make_binary_for_ocr(mrz_crop))
+        mrz_height = int(height * 0.25)
+        bottom_region = gray[height - mrz_height:, :]
+        candidates.append(MRZDetector._preprocess_for_ocr_v2(bottom_region))
 
         # ==========================================
-        # USUL 4: Pastki 15% (faqat MRZ)
+        # USUL 4: To'liq rasm
         # ==========================================
-        mrz_crop = MRZDetector._crop_bottom(gray, 0.15)
-        candidates.append(MRZDetector._make_binary_for_ocr(mrz_crop))
+        candidates.append(MRZDetector._preprocess_for_ocr(gray))
 
         # ==========================================
-        # USUL 5: Inverted (oq fonda qora matn)
+        # USUL 5: Inverted (qora fonda oq matn)
         # ==========================================
-        mrz_crop = MRZDetector._crop_bottom(gray, 0.20)
-        binary = MRZDetector._make_binary_for_ocr(mrz_crop)
-        candidates.append(cv2.bitwise_not(binary))
+        mrz_height = int(height * 0.30)
+        bottom_region = gray[height - mrz_height:, :]
+        inverted = cv2.bitwise_not(bottom_region)
+        candidates.append(MRZDetector._preprocess_for_ocr(inverted))
 
-        print(f"   {len(candidates)} ta variant tayyorlandi", flush=True)
         return candidates
 
     @staticmethod
-    def _crop_bottom(gray: np.ndarray, ratio: float) -> np.ndarray:
-        """Rasmning pastki qismini kesish"""
-        height, width = gray.shape
-        crop_height = int(height * ratio)
-        cropped = gray[height - crop_height:, :]
-
-        # Kattalashtirish (Tesseract uchun optimal - 300 DPI)
-        if cropped.shape[1] < 1000:
-            scale = 1000 / cropped.shape[1]
-            cropped = cv2.resize(cropped, None, fx=scale, fy=scale,
-                               interpolation=cv2.INTER_CUBIC)
-
-        return cropped
-
-    @staticmethod
-    def _make_binary_for_ocr(image: np.ndarray) -> np.ndarray:
+    def _detect_mrz_morphological(gray: np.ndarray) -> Optional[np.ndarray]:
         """
-        Rasmni OQ-QORA qilish - Tesseract uchun optimal.
-        QORA fonda OQ matn - eng yaxshi natija.
-        """
-        # 1. Noise reduction
-        denoised = cv2.GaussianBlur(image, (3, 3), 0)
-
-        # 2. Contrast oshirish (CLAHE)
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(denoised)
-
-        # 3. Otsu binarization - avtomatik threshold
-        _, binary = cv2.threshold(enhanced, 0, 255,
-                                  cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-
-        # 4. Qora fonda oq matn qilish (MRZ odatda qora matn)
-        # Agar oq piksellar ko'p bo'lsa - invert qilish
-        white_ratio = np.sum(binary == 255) / binary.size
-        if white_ratio > 0.5:
-            binary = cv2.bitwise_not(binary)
-
-        # 5. Morphological tozalash
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-
-        return binary
-
-    @staticmethod
-    def _find_mrz_zone(gray: np.ndarray) -> Optional[np.ndarray]:
-        """
-        MRZ zonasini aniq topish.
-        MRZ xususiyatlari:
-        - 2 qator matn
-        - Har bir qator 44 belgi
-        - Pastda joylashgan
-        - Gorizontal yo'nalishda uzun
+        Morphological operations bilan MRZ zonasini topish.
+        MRZ - gorizontal chiziqlar, belgilar orasida kam bo'shliq.
         """
         height, width = gray.shape
 
-        # 1. Sobel gradient (gorizontal chiziqlarni topish)
-        grad_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-        grad_x = cv2.convertScaleAbs(grad_x)
+        # Blackhat morphology - qora matnni topish
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (13, 5))
+        blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
 
-        # 2. Morphological operations
-        # Gorizontal kernel - MRZ belgilarini birlashtirish
-        rect_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 7))
-        closed = cv2.morphologyEx(grad_x, cv2.MORPH_CLOSE, rect_kernel)
+        # Gradient - gorizontal chiziqlarni ajratish
+        grad_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        gradient = cv2.morphologyEx(blackhat, cv2.MORPH_GRADIENT, grad_kernel)
 
-        # 3. Otsu threshold
-        _, thresh = cv2.threshold(closed, 0, 255,
-                                  cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+        # Threshold
+        _, thresh = cv2.threshold(gradient, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
 
-        # 4. Contourlarni topish
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL,
-                                       cv2.CHAIN_APPROX_SIMPLE)
+        # Gorizontal chiziqlarni birlashtirish
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (21, 5))
+        closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, close_kernel)
 
-        # 5. MRZ contourini topish
-        mrz_contour = None
-        max_score = 0
+        # Vertikal yo'nalishda kengaytirish
+        dilate_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 7))
+        dilated = cv2.dilate(closed, dilate_kernel, iterations=2)
+
+        # Contourlarni topish
+        contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        # Eng katta va pastda joylashgan contourni topish
+        best_contour = None
+        best_y = 0
 
         for contour in contours:
             x, y, w, h = cv2.boundingRect(contour)
 
-            # MRZ xususiyatlari:
+            # MRZ xususiyatlari: keng, past balandlik, pastda joylashgan
             aspect_ratio = w / h if h > 0 else 0
-            y_position = y / height  # Pastda bo'lishi kerak
-            width_ratio = w / width  # Keng bo'lishi kerak
+            area_ratio = (w * h) / (width * height)
 
-            # Scoring
-            score = 0
-            if aspect_ratio > 8:  # Juda keng
-                score += 30
-            elif aspect_ratio > 5:
-                score += 20
+            if (aspect_ratio > 5 and  # Keng
+                area_ratio > 0.02 and  # Yetarlicha katta
+                y > height * 0.5 and  # Pastki yarmida
+                w > width * 0.5):  # Keng
+                if y > best_y:
+                    best_y = y
+                    best_contour = contour
 
-            if y_position > 0.7:  # Pastki 30% da
-                score += 40
-            elif y_position > 0.6:
-                score += 20
+        if best_contour is not None:
+            x, y, w, h = cv2.boundingRect(best_contour)
 
-            if width_ratio > 0.7:  # Keng
-                score += 30
-            elif width_ratio > 0.5:
-                score += 15
-
-            if score > max_score:
-                max_score = score
-                mrz_contour = (x, y, w, h)
-
-        if mrz_contour and max_score >= 50:
-            x, y, w, h = mrz_contour
-
-            # Padding qo'shish
-            padding_y = 15
-            padding_x = 10
-            y = max(0, y - padding_y)
-            h = min(height - y, h + padding_y * 2)
-            x = max(0, x - padding_x)
-            w = min(width - x, w + padding_x * 2)
+            # Biroz kengaytirish
+            padding = 20
+            y = max(0, y - padding)
+            h = min(height - y, h + padding * 2)
 
             mrz_region = gray[y:y+h, x:x+w]
-
-            # Kattalashtirish
-            if mrz_region.shape[1] < 1000:
-                scale = 1000 / mrz_region.shape[1]
-                mrz_region = cv2.resize(mrz_region, None, fx=scale, fy=scale,
-                                       interpolation=cv2.INTER_CUBIC)
-
-            return MRZDetector._make_binary_for_ocr(mrz_region)
+            return MRZDetector._preprocess_for_ocr(mrz_region)
 
         return None
+
+    @staticmethod
+    def _preprocess_for_ocr(image: np.ndarray) -> np.ndarray:
+        """OCR uchun rasmni tayyorlash - Variant 1"""
+        # Noise reduction
+        denoised = cv2.fastNlMeansDenoising(image, None, 10, 7, 21)
+
+        # CLAHE - contrast
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(denoised)
+
+        # Adaptive threshold
+        binary = cv2.adaptiveThreshold(
+            enhanced, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            15, 4
+        )
+
+        return binary
+
+    @staticmethod
+    def _preprocess_for_ocr_v2(image: np.ndarray) -> np.ndarray:
+        """OCR uchun rasmni tayyorlash - Variant 2 (boshqa parametrlar)"""
+        # Gaussian blur
+        blurred = cv2.GaussianBlur(image, (3, 3), 0)
+
+        # Otsu threshold
+        _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+
+        # Morphological cleaning
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        cleaned = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+
+        return cleaned
 
 
 # ============================================
