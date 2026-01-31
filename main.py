@@ -7,7 +7,7 @@
 ║  ✅ ICAO 9303 TD3 - Xalqaro standart                                         ║
 ║  ✅ Xavfsiz - Ma'lumotlar serverga yuborilmaydi                              ║
 ║                                                                              ║
-║  Versiya: 2.1.0 (Lokal - Yaxshilangan MRZ Detection)                         ║
+║  Versiya: 2.3.0 (Lokal - Yaxshilangan Binary OCR)                            ║
 ║  Standart: ICAO Doc 9303 Part 4                                              ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
@@ -43,7 +43,7 @@ import cv2
 
 class Config:
     """Tizim sozlamalari"""
-    VERSION = "2.2.0"
+    VERSION = "2.3.0"
     SERVICE_NAME = "Bojxona Passport Scanner (Lokal)"
 
     # Xavfsizlik
@@ -183,6 +183,25 @@ class MRZDetector:
         inverted = cv2.bitwise_not(bottom_region)
         candidates.append(MRZDetector._preprocess_for_ocr(inverted))
 
+        # ==========================================
+        # USUL 6: ANIQ BINARY (M/N farqlash uchun)
+        # ==========================================
+        mrz_height = int(height * 0.30)
+        bottom_region = gray[height - mrz_height:, :]
+        candidates.append(MRZDetector._preprocess_strict_binary(bottom_region))
+
+        # ==========================================
+        # USUL 7: YUQORI KONTRAST
+        # ==========================================
+        mrz_height = int(height * 0.30)
+        bottom_region = gray[height - mrz_height:, :]
+        candidates.append(MRZDetector._preprocess_high_contrast(bottom_region))
+
+        # ==========================================
+        # USUL 8: ANIQ BINARY - to'liq rasm
+        # ==========================================
+        candidates.append(MRZDetector._preprocess_strict_binary(gray))
+
         return candidates
 
     @staticmethod
@@ -282,6 +301,71 @@ class MRZDetector:
 
         return cleaned
 
+    @staticmethod
+    def _preprocess_strict_binary(image: np.ndarray) -> np.ndarray:
+        """
+        MRZ uchun ANIQ oq-qora rasm.
+        M va N harflarini farqlash uchun maxsus ishlov.
+        """
+        height, width = image.shape
+
+        # 1. Rasmni 2x kattalashtirish (aniqlik uchun)
+        if width < 2000:
+            scale = 2.0
+            image = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+        # 2. Kuchli kontrast
+        # Histogram equalization
+        equalized = cv2.equalizeHist(image)
+
+        # 3. Gaussian blur - shovqinni kamaytirish
+        blurred = cv2.GaussianBlur(equalized, (3, 3), 0)
+
+        # 4. Aniq binary threshold (Otsu)
+        _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+
+        # 5. Harflarni yo'g'onlashtirish (M va N ni farqlash uchun)
+        # M harfida 2 ta vertikal chiziq, N da 1 ta diagonal
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        dilated = cv2.dilate(binary, kernel, iterations=1)
+
+        # 6. Mayda nuqtalarni olib tashlash
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        cleaned = cv2.morphologyEx(dilated, cv2.MORPH_CLOSE, kernel_close)
+
+        return cleaned
+
+    @staticmethod
+    def _preprocess_high_contrast(image: np.ndarray) -> np.ndarray:
+        """
+        Yuqori kontrastli preprocessing.
+        Matnni aniqroq ajratish uchun.
+        """
+        height, width = image.shape
+
+        # 1. Resize
+        if width < 1500:
+            scale = 1500 / width
+            image = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+        # 2. Bilateral filter - shovqinni kamaytirish, qirralarni saqlash
+        filtered = cv2.bilateralFilter(image, 9, 75, 75)
+
+        # 3. CLAHE - mahalliy kontrast
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(filtered)
+
+        # 4. Sharpen - keskinlashtirish
+        kernel_sharpen = np.array([[-1, -1, -1],
+                                   [-1,  9, -1],
+                                   [-1, -1, -1]])
+        sharpened = cv2.filter2D(enhanced, -1, kernel_sharpen)
+
+        # 5. Binary threshold
+        _, binary = cv2.threshold(sharpened, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+
+        return binary
+
 
 # ============================================
 # LOKAL OCR ENGINE (Tesseract) - Yaxshilangan
@@ -361,6 +445,8 @@ class LocalOCREngine:
         # Line 1 tekshiruvlari
         if line1.startswith('P'):
             score += 20
+        if line1.startswith('P<'):
+            score += 10  # P< dan boshlanishi yaxshiroq
         if '<' in line1:
             score += 10
         if '<<' in line1:
@@ -374,6 +460,20 @@ class LocalOCREngine:
         uzb_prefixes = {'AA', 'AB', 'AC', 'AD', 'FA', 'FB', 'FC', 'FD', 'FK', 'HA', 'HB'}
         if line2[:2] in uzb_prefixes:
             score += 25
+
+        # Nationality to'g'ri aniqlangan (UZB)
+        if len(line2) >= 13:
+            nationality = line2[10:13]
+            if nationality == 'UZB':
+                score += 20  # UZB to'g'ri o'qilgan
+
+        # Jins to'g'ri aniqlangan (M yoki F) - MUHIM
+        if len(line2) >= 21:
+            sex_char = line2[20]
+            if sex_char in ('M', 'F'):
+                score += 25  # To'g'ri M yoki F
+            elif sex_char in ('N', 'W', 'H', 'K'):
+                score -= 10  # N - bu xato (M bo'lishi kerak)
 
         # < belgilari soni (MRZ da ko'p bo'lishi kerak)
         chevron_count = line1.count('<') + line2.count('<')
