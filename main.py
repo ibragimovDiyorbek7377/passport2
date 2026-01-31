@@ -7,7 +7,7 @@
 ║  ✅ ICAO 9303 TD3 - Xalqaro standart                                         ║
 ║  ✅ Xavfsiz - Ma'lumotlar serverga yuborilmaydi                              ║
 ║                                                                              ║
-║  Versiya: 2.0.0 (Lokal)                                                      ║
+║  Versiya: 2.1.0 (Lokal - Yaxshilangan MRZ Detection)                         ║
 ║  Standart: ICAO Doc 9303 Part 4                                              ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
@@ -27,7 +27,7 @@ from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.templating import Jinja2Templates
 
 # Image Processing
-from PIL import Image, ImageFilter, ImageEnhance
+from PIL import Image, ImageFilter, ImageEnhance, ImageOps
 import numpy as np
 
 # OCR (Lokal)
@@ -43,7 +43,7 @@ import cv2
 
 class Config:
     """Tizim sozlamalari"""
-    VERSION = "2.0.0"
+    VERSION = "2.2.0"
     SERVICE_NAME = "Bojxona Passport Scanner (Lokal)"
 
     # Xavfsizlik
@@ -51,10 +51,6 @@ class Config:
     ALLOWED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp'}
     RATE_LIMIT_WINDOW = 60  # sekund
     MAX_REQUESTS_PER_WINDOW = 30
-
-    # OCR sozlamalari - MRZ uchun optimallashtirilgan
-    TESSERACT_CONFIG = '--psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<'
-    TESSERACT_LANG = 'eng'
 
     # MRZ parametrlari (ICAO 9303 TD3)
     MRZ_LINE_LENGTH = 44
@@ -111,62 +107,200 @@ class SecurityModule:
 
 
 # ============================================
-# RASM PREPROCESSING (OpenCV)
+# YAXSHILANGAN MRZ DETECTOR (OpenCV)
 # ============================================
 
-class ImagePreprocessor:
-    """Rasmni OCR uchun tayyorlash"""
+class MRZDetector:
+    """
+    MRZ zonasini topish va OCR uchun tayyorlash.
+    Bir nechta usul bilan sinab ko'radi.
+    """
 
     @staticmethod
-    def preprocess_for_mrz(image_bytes: bytes) -> np.ndarray:
-        """MRZ zonasini OCR uchun tayyorlash"""
-
+    def detect_and_extract(image_bytes: bytes) -> List[np.ndarray]:
+        """
+        MRZ zonasini topish va bir nechta variant qaytarish.
+        Har bir variant boshqa preprocessing bilan.
+        """
         # PIL dan numpy array ga
         pil_image = Image.open(io.BytesIO(image_bytes))
+
+        # EXIF orientation ni to'g'rilash
+        try:
+            pil_image = ImageOps.exif_transpose(pil_image)
+        except:
+            pass
+
         if pil_image.mode != 'RGB':
             pil_image = pil_image.convert('RGB')
-        img_array = np.array(pil_image)
 
-        # Grayscale
+        img_array = np.array(pil_image)
         gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
 
-        # Resize (Tesseract uchun optimal)
+        # Rasmni kattalashtirish (agar kichik bo'lsa)
         height, width = gray.shape
-        if width < 1000:
-            scale = 1000 / width
+        if width < 1200:
+            scale = 1200 / width
             gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            height, width = gray.shape
 
+        candidates = []
+
+        # ==========================================
+        # USUL 1: Morphological MRZ Detection
+        # ==========================================
+        try:
+            mrz_region = MRZDetector._detect_mrz_morphological(gray)
+            if mrz_region is not None:
+                candidates.append(mrz_region)
+        except Exception as e:
+            print(f"   Morphological detection xatosi: {e}", flush=True)
+
+        # ==========================================
+        # USUL 2: Pastki 30% ni kesish (klassik)
+        # ==========================================
+        mrz_height = int(height * 0.30)
+        bottom_region = gray[height - mrz_height:, :]
+        candidates.append(MRZDetector._preprocess_for_ocr(bottom_region))
+
+        # ==========================================
+        # USUL 3: Pastki 25% - boshqa preprocessing
+        # ==========================================
+        mrz_height = int(height * 0.25)
+        bottom_region = gray[height - mrz_height:, :]
+        candidates.append(MRZDetector._preprocess_for_ocr_v2(bottom_region))
+
+        # ==========================================
+        # USUL 4: To'liq rasm
+        # ==========================================
+        candidates.append(MRZDetector._preprocess_for_ocr(gray))
+
+        # ==========================================
+        # USUL 5: Inverted (qora fonda oq matn)
+        # ==========================================
+        mrz_height = int(height * 0.30)
+        bottom_region = gray[height - mrz_height:, :]
+        inverted = cv2.bitwise_not(bottom_region)
+        candidates.append(MRZDetector._preprocess_for_ocr(inverted))
+
+        return candidates
+
+    @staticmethod
+    def _detect_mrz_morphological(gray: np.ndarray) -> Optional[np.ndarray]:
+        """
+        Morphological operations bilan MRZ zonasini topish.
+        MRZ - gorizontal chiziqlar, belgilar orasida kam bo'shliq.
+        """
+        height, width = gray.shape
+
+        # Blackhat morphology - qora matnni topish
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (13, 5))
+        blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
+
+        # Gradient - gorizontal chiziqlarni ajratish
+        grad_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        gradient = cv2.morphologyEx(blackhat, cv2.MORPH_GRADIENT, grad_kernel)
+
+        # Threshold
+        _, thresh = cv2.threshold(gradient, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+
+        # Gorizontal chiziqlarni birlashtirish
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (21, 5))
+        closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, close_kernel)
+
+        # Vertikal yo'nalishda kengaytirish
+        dilate_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 7))
+        dilated = cv2.dilate(closed, dilate_kernel, iterations=2)
+
+        # Contourlarni topish
+        contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        # Eng katta va pastda joylashgan contourni topish
+        best_contour = None
+        best_y = 0
+
+        for contour in contours:
+            x, y, w, h = cv2.boundingRect(contour)
+
+            # MRZ xususiyatlari: keng, past balandlik, pastda joylashgan
+            aspect_ratio = w / h if h > 0 else 0
+            area_ratio = (w * h) / (width * height)
+
+            if (aspect_ratio > 5 and  # Keng
+                area_ratio > 0.02 and  # Yetarlicha katta
+                y > height * 0.5 and  # Pastki yarmida
+                w > width * 0.5):  # Keng
+                if y > best_y:
+                    best_y = y
+                    best_contour = contour
+
+        if best_contour is not None:
+            x, y, w, h = cv2.boundingRect(best_contour)
+
+            # Biroz kengaytirish
+            padding = 20
+            y = max(0, y - padding)
+            h = min(height - y, h + padding * 2)
+
+            mrz_region = gray[y:y+h, x:x+w]
+            return MRZDetector._preprocess_for_ocr(mrz_region)
+
+        return None
+
+    @staticmethod
+    def _preprocess_for_ocr(image: np.ndarray) -> np.ndarray:
+        """OCR uchun rasmni tayyorlash - Variant 1"""
         # Noise reduction
-        denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
+        denoised = cv2.fastNlMeansDenoising(image, None, 10, 7, 21)
 
-        # Contrast enhancement (CLAHE)
+        # CLAHE - contrast
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         enhanced = clahe.apply(denoised)
 
-        # Adaptive thresholding
+        # Adaptive threshold
         binary = cv2.adaptiveThreshold(
             enhanced, 255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
             cv2.THRESH_BINARY,
-            11, 2
+            15, 4
         )
 
         return binary
 
     @staticmethod
-    def extract_mrz_region(img_array: np.ndarray) -> np.ndarray:
-        """MRZ zonasini kesish (pastki 25%)"""
-        height = img_array.shape[0]
-        mrz_height = int(height * 0.25)
-        return img_array[height - mrz_height:, :]
+    def _preprocess_for_ocr_v2(image: np.ndarray) -> np.ndarray:
+        """OCR uchun rasmni tayyorlash - Variant 2 (boshqa parametrlar)"""
+        # Gaussian blur
+        blurred = cv2.GaussianBlur(image, (3, 3), 0)
+
+        # Otsu threshold
+        _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+
+        # Morphological cleaning
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        cleaned = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+
+        return cleaned
 
 
 # ============================================
-# LOKAL OCR ENGINE (Tesseract)
+# LOKAL OCR ENGINE (Tesseract) - Yaxshilangan
 # ============================================
 
 class LocalOCREngine:
-    """Tesseract OCR - 100% Lokal"""
+    """Tesseract OCR - 100% Lokal, bir nechta config bilan"""
+
+    # Turli OCR konfiguratsiyalari
+    OCR_CONFIGS = [
+        # Config 1: MRZ uchun maxsus (PSM 6 - uniform block)
+        '--psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<',
+        # Config 2: Single line (PSM 7)
+        '--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<',
+        # Config 3: Sparse text (PSM 11)
+        '--psm 11 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<',
+        # Config 4: Raw line (PSM 13)
+        '--psm 13 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<',
+    ]
 
     def __init__(self):
         try:
@@ -175,46 +309,83 @@ class LocalOCREngine:
         except Exception as e:
             raise RuntimeError(f"Tesseract topilmadi: {e}")
 
-    def extract_text(self, image: np.ndarray) -> str:
-        """Rasmdan matn ajratish"""
-        return pytesseract.image_to_string(
-            image,
-            lang=Config.TESSERACT_LANG,
-            config=Config.TESSERACT_CONFIG
-        )
-
     def extract_mrz_lines(self, image_bytes: bytes) -> Tuple[str, str]:
-        """MRZ qatorlarini ajratish"""
+        """MRZ qatorlarini bir nechta usul bilan ajratish"""
         print("🔍 MRZ qatorlarini qidirish...", flush=True)
 
-        # Preprocessing
-        processed = ImagePreprocessor.preprocess_for_mrz(image_bytes)
+        # Rasmdan turli variantlar olish
+        detector = MRZDetector()
+        image_variants = detector.detect_and_extract(image_bytes)
 
-        # MRZ zonasini kesish
-        mrz_region = ImagePreprocessor.extract_mrz_region(processed)
+        print(f"   {len(image_variants)} ta rasm varianti tayyorlandi", flush=True)
 
-        # OCR
-        raw_text = self.extract_text(mrz_region)
+        all_candidates = []
 
-        # MRZ qatorlarini topish
-        lines = self._find_mrz_lines(raw_text)
+        # Har bir rasm varianti uchun
+        for i, img in enumerate(image_variants):
+            # Har bir OCR config uchun
+            for j, config in enumerate(self.OCR_CONFIGS):
+                try:
+                    raw_text = pytesseract.image_to_string(img, lang='eng', config=config)
+                    lines = self._find_mrz_lines(raw_text)
 
-        # Agar topilmasa, to'liq rasmdan qayta urinish
-        if len(lines) < 2:
-            raw_text = self.extract_text(processed)
-            lines = self._find_mrz_lines(raw_text)
+                    if len(lines) >= 2:
+                        line1 = self._normalize_line(lines[0])
+                        line2 = self._normalize_line(lines[1])
 
-        if len(lines) < 2:
+                        # Sifatni baholash
+                        score = self._score_mrz(line1, line2)
+                        all_candidates.append((score, line1, line2, i, j))
+                        print(f"   Variant {i+1}, Config {j+1}: score={score}", flush=True)
+
+                except Exception as e:
+                    continue
+
+        if not all_candidates:
             raise ValueError("MRZ topilmadi. Aniqroq rasm yuboring.")
 
-        line1 = self._normalize_line(lines[0])
-        line2 = self._normalize_line(lines[1])
+        # Eng yaxshi natijani tanlash
+        all_candidates.sort(reverse=True, key=lambda x: x[0])
+        best = all_candidates[0]
 
-        print(f"✅ MRZ topildi", flush=True)
-        print(f"   Line1: {line1}", flush=True)
-        print(f"   Line2: {line2}", flush=True)
+        print(f"✅ MRZ topildi (score={best[0]}, variant={best[3]+1}, config={best[4]+1})", flush=True)
+        print(f"   Line1: {best[1]}", flush=True)
+        print(f"   Line2: {best[2]}", flush=True)
 
-        return line1, line2
+        return best[1], best[2]
+
+    def _score_mrz(self, line1: str, line2: str) -> int:
+        """MRZ sifatini baholash"""
+        score = 0
+
+        # Line 1 tekshiruvlari
+        if line1.startswith('P'):
+            score += 20
+        if '<' in line1:
+            score += 10
+        if '<<' in line1:
+            score += 15
+
+        # Line 2 tekshiruvlari
+        digit_count = sum(c.isdigit() for c in line2)
+        score += min(digit_count * 2, 30)  # Max 30 ball
+
+        # O'zbekiston pasporti prefikslari
+        uzb_prefixes = {'AA', 'AB', 'AC', 'AD', 'FA', 'FB', 'FC', 'FD', 'FK', 'HA', 'HB'}
+        if line2[:2] in uzb_prefixes:
+            score += 25
+
+        # < belgilari soni (MRZ da ko'p bo'lishi kerak)
+        chevron_count = line1.count('<') + line2.count('<')
+        score += min(chevron_count, 20)
+
+        # Uzunlik tekshiruvi
+        if len(line1) == 44:
+            score += 10
+        if len(line2) == 44:
+            score += 10
+
+        return score
 
     def _find_mrz_lines(self, text: str) -> List[str]:
         """Matndan MRZ qatorlarini ajratish"""
@@ -223,35 +394,41 @@ class LocalOCREngine:
         for line in text.split('\n'):
             cleaned = self._clean_line(line)
 
-            if len(cleaned) >= 40:
+            if len(cleaned) >= 38:  # Minimum uzunlik
                 # P< bilan boshlansa - Line 1
                 if cleaned.startswith('P') or 'P<' in cleaned[:5]:
                     candidates.insert(0, cleaned)
                 # Raqamlar ko'p bo'lsa - Line 2
-                elif sum(c.isdigit() for c in cleaned) >= 10:
+                elif sum(c.isdigit() for c in cleaned) >= 8:
                     candidates.append(cleaned)
-                elif len(cleaned) >= 44:
+                elif len(cleaned) >= 42:
                     candidates.append(cleaned)
 
-        # Concatenated MRZ (88 belgi)
+        # Concatenated MRZ (80+ belgi)
         full_text = ''.join(text.split())
         full_text = self._clean_line(full_text)
-        if len(full_text) >= 88 and 'P<' in full_text[:10]:
+        if len(full_text) >= 80 and 'P<' in full_text[:10]:
             return self._smart_split(full_text)
 
         return candidates[:2]
 
     def _smart_split(self, text: str) -> List[str]:
-        """88 belgini 2 qatorga ajratish"""
-        # Line 2 boshlanishini topish (Passport + Check + Nationality pattern)
+        """Uzun matnni 2 qatorga ajratish"""
+        # Line 2 boshlanishini topish
+        # O'zbekiston pasportlari: AA, FA, FK, HA va h.k.
         pattern = r'([A-Z]{2}\d{7})(\d)([A-Z]{3})(\d{6})(\d)'
         match = re.search(pattern, text)
 
         if match:
             split_pos = match.start()
-            line1 = text[:44] if split_pos < 44 else text[:split_pos]
-            line2 = text[split_pos:split_pos+44]
+            if split_pos >= 40:
+                line1 = text[:44]
+                line2 = text[44:88]
+            else:
+                line1 = text[:split_pos]
+                line2 = text[split_pos:split_pos+44]
         else:
+            # Default split
             line1 = text[:44]
             line2 = text[44:88]
 
@@ -329,13 +506,16 @@ class ICAO9303Parser:
         if len(line1) != 44 or len(line2) != 44:
             raise ValueError(f"MRZ uzunligi noto'g'ri: L1={len(line1)}, L2={len(line2)}")
 
+        # Line2 preprocessing - filler belgilarini tiklash
+        line2 = cls._preprocess_line2(line2)
+
         # ==========================================
         # LINE 1 PARSING
         # ==========================================
-        doc_type = line1[0]                    # P
-        doc_subtype = line1[1]                 # <
-        issuing_country = line1[2:5].replace('<', '')  # UZB
-        names_section = line1[5:44]            # ALLAMOV<<OTABEK<KHUDAYBERGANOVICH<<<<<
+        doc_type = line1[0]
+        doc_subtype = line1[1]
+        issuing_country = line1[2:5].replace('<', '')
+        names_section = line1[5:44]
 
         # Ism va familiyani ajratish
         surname, given_names = cls._parse_names(names_section)
@@ -343,17 +523,17 @@ class ICAO9303Parser:
         # ==========================================
         # LINE 2 PARSING (ICAO 9303 TD3 POZITSIYALAR)
         # ==========================================
-        passport_raw = line2[0:9]              # FK0005527
-        passport_check = line2[9]              # 8
-        nationality_raw = line2[10:13]         # UZB
-        dob_raw = line2[13:19]                 # 901107
-        dob_check = line2[19]                  # 8
-        sex = line2[20]                        # M
-        expiry_raw = line2[21:27]              # 290430
-        expiry_check = line2[27]               # 8
-        personal_num_raw = line2[28:42]        # 30711903330048
-        personal_num_check = line2[42]         # 2
-        composite_check = line2[43]            # 6
+        passport_raw = line2[0:9]
+        passport_check = line2[9]
+        nationality_raw = line2[10:13]
+        dob_raw = line2[13:19]
+        dob_check = line2[19]
+        sex = line2[20]
+        expiry_raw = line2[21:27]
+        expiry_check = line2[27]
+        personal_num_raw = line2[28:42]
+        personal_num_check = line2[42]
+        composite_check = line2[43]
 
         # ==========================================
         # OCR XATOLARINI TUZATISH
@@ -425,6 +605,55 @@ class ICAO9303Parser:
     # ==========================================
 
     @classmethod
+    def _preprocess_line2(cls, line2: str) -> str:
+        """
+        Line2 preprocessing - OCR xatolarini tuzatish.
+        Asosiy muammo: '<' belgisi '0' deb o'qiladi.
+
+        O'zbekiston pasport Line2 formati:
+        FB0292047<0UZB031225<M291018<3525120374400<<<<0
+        [passport][c][nat][dob  ][c][s][expiry][c][pinfl        ][c][comp]
+
+        Pozitsiyalar (0-indexed):
+        0-8:   Passport number (9 belgi)
+        9:     Check digit
+        10-12: Nationality (3 belgi)
+        13-18: DOB (6 raqam)
+        19:    DOB check digit
+        20:    Sex (M/F)
+        21-26: Expiry (6 raqam)
+        27:    Expiry check digit
+        28-41: Personal number / PINFL (14 belgi)
+        42:    Personal number check digit
+        43:    Composite check digit
+        """
+        if len(line2) != 44:
+            return line2
+
+        # Line2 ni list ga aylantirish (o'zgartirish uchun)
+        chars = list(line2)
+
+        # Pozitsiya 20 - Jins (M yoki F bo'lishi kerak)
+        sex_char = chars[20]
+        if sex_char not in ('M', 'F', '<'):
+            # OCR xatolari: N->M, W->M, H->M
+            if sex_char in ('N', 'W', 'H', 'K', '0'):
+                chars[20] = 'M'
+            elif sex_char in ('E', 'P'):
+                chars[20] = 'F'
+
+        # Oxirgi 4 belgi ko'pincha filler (<<<<)
+        # Agar '0000' bo'lsa, '<<<0' ga o'zgartirish
+        if ''.join(chars[40:44]) == '0000':
+            chars[40:43] = ['<', '<', '<']
+
+        # Agar oxirgi 5 belgi '00000' bo'lsa
+        if ''.join(chars[39:44]) == '00000':
+            chars[39:43] = ['<', '<', '<', '<']
+
+        return ''.join(chars)
+
+    @classmethod
     def _parse_names(cls, names_section: str) -> Tuple[str, str]:
         """Familiya va ismni ajratish"""
         if '<<' in names_section:
@@ -452,22 +681,34 @@ class ICAO9303Parser:
 
     @classmethod
     def _fix_nationality(cls, raw: str, passport_number: str) -> str:
-        """Nationality ni tuzatish"""
-        nationality = raw.replace('<', '')
+        """Nationality ni tuzatish - kengaytirilgan OCR xatolari"""
+        nationality = raw.replace('<', '').replace('0', 'O')
 
-        # OCR xatolarini tuzatish
+        # OCR xatolarini tuzatish - kengaytirilgan ro'yxat
         fixes = {
+            # UZB variantlari
             'ZBO': 'UZB', 'LZB': 'UZB', 'USB': 'UZB',
             'U2B': 'UZB', 'UZ8': 'UZB', 'O2B': 'UZB',
-            'UZ0': 'UZB', '0ZB': 'UZB'
+            'UZ0': 'UZB', '0ZB': 'UZB', 'UZO': 'UZB',
+            'U28': 'UZB', 'OZB': 'UZB', 'UZ6': 'UZB',
+            '0Z8': 'UZB', '028': 'UZB', 'OZ8': 'UZB',
+            'U7B': 'UZB', '07B': 'UZB', 'O7B': 'UZB',
+            '7B0': 'UZB', '7BO': 'UZB', 'TBI': 'UZB',
+            # Raqamli variantlar
+            '007': 'UZB', '070': 'UZB', '700': 'UZB',
         }
         nationality = fixes.get(nationality, nationality)
 
-        # O'zbekiston pasporti prefiksini tekshirish
-        if passport_number[:2] in cls.UZB_PREFIXES and nationality != 'UZB':
-            nationality = 'UZB'
+        # O'zbekiston pasporti prefiksini tekshirish - har doim UZB
+        if len(passport_number) >= 2 and passport_number[:2] in cls.UZB_PREFIXES:
+            return 'UZB'
 
-        return nationality
+        # Agar hali ham noto'g'ri bo'lsa va O'zbekiston prefiksi bo'lsa
+        if not nationality.isalpha() or len(nationality) != 3:
+            if len(passport_number) >= 2 and passport_number[:2] in cls.UZB_PREFIXES:
+                return 'UZB'
+
+        return nationality if nationality else 'UZB'
 
     @classmethod
     def _fix_digits(cls, raw: str) -> str:
@@ -476,11 +717,17 @@ class ICAO9303Parser:
 
     @classmethod
     def _fix_sex(cls, raw: str) -> str:
-        """Jinsni tuzatish"""
+        """Jinsni tuzatish - OCR xatolarini hisobga olish"""
         raw = raw.upper()
         if raw in ('M', 'F'):
             return raw
-        return 'X'  # Noma'lum
+        # OCR xatolari: N->M, W->M, H->M
+        if raw in ('N', 'W', 'H', 'K'):
+            return 'M'
+        # OCR xatolari: E->F, P->F
+        if raw in ('E', 'P'):
+            return 'F'
+        return 'M'  # Default erkak (O'zbekiston pasportlari uchun ko'p holat)
 
     @classmethod
     def _format_date(cls, yymmdd: str) -> str:
@@ -503,20 +750,15 @@ class ICAO9303Parser:
 
     @classmethod
     def _calculate_checksum(cls, data: str) -> int:
-        """
-        ICAO 9303 Modulo 10 checksum
-        Algorithm: Sum of (value × weight) mod 10
-        Weights: 7, 3, 1 (repeating)
-        Values: 0-9 = 0-9, A-Z = 10-35, < = 0
-        """
+        """ICAO 9303 Modulo 10 checksum"""
         total = 0
         for i, char in enumerate(data):
             if char.isdigit():
                 value = int(char)
             elif char.isalpha():
-                value = ord(char.upper()) - 55  # A=10, B=11, ..., Z=35
+                value = ord(char.upper()) - 55
             else:
-                value = 0  # < va boshqa belgilar
+                value = 0
 
             total += value * cls.WEIGHTS[i % 3]
 
@@ -726,6 +968,7 @@ if __name__ == "__main__":
 ║  🔒 API YO'Q - Barcha ma'lumotlar lokal qayta ishlanadi         ║
 ║  ✅ Tesseract OCR - Offline ishlaydi                            ║
 ║  ✅ ICAO 9303 TD3 - Xalqaro standart                            ║
+║  ✅ Yaxshilangan MRZ Detection (Morphological)                  ║
 ║                                                                  ║
 ║  Port: {port}                                                       ║
 ╚══════════════════════════════════════════════════════════════════╝
