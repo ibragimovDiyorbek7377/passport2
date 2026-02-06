@@ -3,10 +3,11 @@
 ║           BOJXONA PASSPORT SCANNER - TELEGRAM BOT                            ║
 ║                                                                              ║
 ║  ✅ To'g'ridan-to'g'ri rasm skanerlash (Mini App shart emas)                ║
-║  ✅ Tesseract OCR - 100% Lokal                                               ║
+║  ✅ DeepSeek OCR - DeepSeek-OCR-Latest-BF16.I64 model                        ║
+║  ✅ Tesseract OCR - Fallback engine                                          ║
 ║  ✅ ICAO 9303 TD3 - Xalqaro standart                                         ║
 ║                                                                              ║
-║  Versiya: 2.0.0                                                              ║
+║  Versiya: 3.0.0                                                              ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -80,7 +81,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ ICAO 9303 TD3 standartiga mos MRZ skanerlash\n"
         f"✅ Pasport raqami, JSHSHIR/PNFL ekstraktsiyasi\n"
         f"✅ Avtomatik tekshiruv va validatsiya\n"
-        f"✅ 100% Lokal - Ma'lumotlar serverga yuborilmaydi\n\n"
+        f"✅ DeepSeek OCR - Yuqori aniqlikdagi skanerlash\n\n"
         f"<b>Foydalanish:</b>\n"
         f"📷 <i>Pasport rasmini to'g'ridan-to'g'ri yuboring</i>\n"
         f"<i>yoki Mini App tugmasini bosing</i>"
@@ -123,7 +124,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start - Boshlash\n"
         "/help - Yordam\n"
         "/info - Tizim haqida\n\n"
-        "<b>Versiya:</b> 2.0.0 (Lokal)\n"
+        "<b>Versiya:</b> 3.0.0 (DeepSeek OCR)\n"
         "<b>Standard:</b> ICAO 9303 TD3"
     )
 
@@ -135,15 +136,15 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     info_text = (
         "ℹ️ <b>Tizim Ma'lumotlari</b>\n\n"
         "<b>Nomi:</b> Bojxona Passport Scanner\n"
-        "<b>Versiya:</b> 2.0.0 (Lokal)\n"
+        "<b>Versiya:</b> 3.0.0 (DeepSeek OCR)\n"
         "<b>Standard:</b> ICAO 9303 TD3\n"
-        "<b>OCR Engine:</b> Tesseract OCR (100% Lokal)\n"
+        "<b>OCR Engine:</b> DeepSeek OCR (DeepSeek-OCR-Latest-BF16.I64)\n"
+        "<b>Fallback:</b> Tesseract OCR\n"
         "<b>Backend:</b> FastAPI + Python\n"
         "<b>Frontend:</b> Telegram Mini App\n\n"
         "<b>Xavfsizlik:</b>\n"
-        "🔒 API ishlatilmaydi\n"
-        "🔒 Ma'lumotlar serverga yuborilmaydi\n"
-        "🔒 Barcha qayta ishlash lokal\n\n"
+        "🔒 DeepSeek OCR - Xavfsiz API orqali\n"
+        "🔒 Tesseract fallback - Lokal qayta ishlash\n\n"
         "<b>Qo'llab-quvvatlanadigan hujjatlar:</b>\n"
         "• O'zbekiston Respublikasi Biometrik Pasporti\n\n"
         "<b>Ekstraktsiya qilinadigan ma'lumotlar:</b>\n"
@@ -170,7 +171,7 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Handle photos sent directly to the bot
-    Lokal Tesseract OCR ishlatib skanerlash
+    DeepSeek OCR ishlatib skanerlash (Tesseract fallback)
     """
     user = update.effective_user
     logger.info(f"📸 Rasm qabul qilindi: {user.first_name} ({user.id})")
@@ -223,7 +224,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"<b>JSHSHIR:</b> <code>{result.get('pinfl', 'N/A')}</code>\n"
             f"<b>Fuqarolik:</b> {result.get('nationality', 'N/A')}\n\n"
             f"{status_emoji} <b>Validatsiya:</b> {validation_status}\n\n"
-            f"<i>🔒 100% Lokal - Ma'lumotlar serverga yuborilmadi</i>"
+            f"<i>🤖 DeepSeek OCR - Yuqori aniqlik bilan skanerlandi</i>"
         )
 
         # Validatsiya tafsilotlarini qo'shish
@@ -326,7 +327,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"<b>JSHSHIR:</b> <code>{result.get('pinfl', 'N/A')}</code>\n"
                 f"<b>Fuqarolik:</b> {result.get('nationality', 'N/A')}\n\n"
                 f"{status_emoji} <b>Validatsiya:</b> {validation_status}\n\n"
-                f"<i>🔒 100% Lokal - Ma'lumotlar serverga yuborilmadi</i>"
+                f"<i>🤖 DeepSeek OCR - Yuqori aniqlik bilan skanerlandi</i>"
             )
 
             await processing_msg.edit_text(response_text, parse_mode='HTML')

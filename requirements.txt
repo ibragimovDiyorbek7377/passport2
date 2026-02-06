@@ -11,8 +11,11 @@ python-telegram-bot>=22.0
 Pillow==10.2.0
 numpy>=1.24.0
 
-# OCR - Tesseract (100% Lokal)
+# OCR - Tesseract (Fallback)
 pytesseract>=0.3.10
+
+# DeepSeek OCR API (OpenAI-compatible)
+openai>=1.0.0
 
 # OpenCV - Rasm preprocessing
 opencv-python-headless>=4.8.0

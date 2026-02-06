@@ -1,13 +1,13 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║           BOJXONA PASSPORT SCANNER - 100% LOKAL VERSIYA                      ║
+║           BOJXONA PASSPORT SCANNER - DeepSeek OCR                            ║
 ║                                                                              ║
-║  ✅ API YO'Q - To'liq offline ishlaydi                                       ║
-║  ✅ Tesseract OCR - Lokal OCR engine                                         ║
+║  ✅ DeepSeek OCR - DeepSeek-OCR-Latest-BF16.I64 model                        ║
+║  ✅ Tesseract OCR - Fallback lokal engine                                    ║
 ║  ✅ ICAO 9303 TD3 - Xalqaro standart                                         ║
-║  ✅ Xavfsiz - Ma'lumotlar serverga yuborilmaydi                              ║
+║  ✅ Xavfsiz - Yuqori aniqlik                                                ║
 ║                                                                              ║
-║  Versiya: 2.3.0 (Lokal - Yaxshilangan Binary OCR)                            ║
+║  Versiya: 3.0.0 (DeepSeek OCR)                                              ║
 ║  Standart: ICAO Doc 9303 Part 4                                              ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
@@ -16,6 +16,7 @@ import io
 import os
 import re
 import time
+import base64
 from datetime import datetime
 from typing import Dict, Optional, Tuple, List
 from dataclasses import dataclass
@@ -30,8 +31,11 @@ from fastapi.templating import Jinja2Templates
 from PIL import Image, ImageFilter, ImageEnhance, ImageOps
 import numpy as np
 
-# OCR (Lokal)
+# OCR (Lokal - fallback)
 import pytesseract
+
+# DeepSeek OCR API
+from openai import OpenAI
 
 # OpenCV (Lokal image preprocessing)
 import cv2
@@ -43,8 +47,13 @@ import cv2
 
 class Config:
     """Tizim sozlamalari"""
-    VERSION = "2.3.0"
-    SERVICE_NAME = "Bojxona Passport Scanner (Lokal)"
+    VERSION = "3.0.0"
+    SERVICE_NAME = "Bojxona Passport Scanner (DeepSeek OCR)"
+
+    # DeepSeek OCR
+    DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+    DEEPSEEK_MODEL = "DeepSeek-OCR-Latest-BF16.I64"
+    DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 
     # Xavfsizlik
     MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
@@ -368,36 +377,158 @@ class MRZDetector:
 
 
 # ============================================
-# LOKAL OCR ENGINE (Tesseract) - Yaxshilangan
+# DeepSeek OCR ENGINE
 # ============================================
 
-class LocalOCREngine:
-    """Tesseract OCR - 100% Lokal, bir nechta config bilan"""
+class DeepSeekOCREngine:
+    """
+    DeepSeek OCR - DeepSeek-OCR-Latest-BF16.I64 model.
+    Tesseract OCR fallback sifatida qoldirilgan.
+    """
 
-    # Turli OCR konfiguratsiyalari
+    # Tesseract fallback konfiguratsiyalari
     OCR_CONFIGS = [
-        # Config 1: MRZ uchun maxsus (PSM 6 - uniform block)
         '--psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<',
-        # Config 2: Single line (PSM 7)
         '--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<',
-        # Config 3: Sparse text (PSM 11)
-        '--psm 11 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<',
-        # Config 4: Raw line (PSM 13)
         '--psm 13 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<',
     ]
 
     def __init__(self):
+        self.deepseek_available = False
+        self.client = None
+
+        # DeepSeek API ni sozlash
+        if Config.DEEPSEEK_API_KEY:
+            try:
+                self.client = OpenAI(
+                    api_key=Config.DEEPSEEK_API_KEY,
+                    base_url=Config.DEEPSEEK_BASE_URL
+                )
+                self.deepseek_available = True
+                print(f"✅ DeepSeek OCR initialized (model: {Config.DEEPSEEK_MODEL})", flush=True)
+            except Exception as e:
+                print(f"⚠️ DeepSeek OCR xatosi: {e}. Tesseract fallback ishlatiladi.", flush=True)
+        else:
+            print("⚠️ DEEPSEEK_API_KEY topilmadi. Tesseract fallback ishlatiladi.", flush=True)
+
+        # Tesseract fallback
         try:
             version = pytesseract.get_tesseract_version()
-            print(f"✅ Tesseract OCR v{version} initialized", flush=True)
+            print(f"✅ Tesseract OCR v{version} (fallback) initialized", flush=True)
         except Exception as e:
-            raise RuntimeError(f"Tesseract topilmadi: {e}")
+            if not self.deepseek_available:
+                raise RuntimeError(f"Na DeepSeek, na Tesseract ishlamaydi: {e}")
+            print(f"⚠️ Tesseract topilmadi (faqat DeepSeek ishlatiladi)", flush=True)
 
     def extract_mrz_lines(self, image_bytes: bytes) -> Tuple[str, str]:
-        """MRZ qatorlarini bir nechta usul bilan ajratish"""
+        """MRZ qatorlarini ajratish - avval DeepSeek, keyin Tesseract fallback"""
         print("🔍 MRZ qatorlarini qidirish...", flush=True)
 
-        # Rasmdan turli variantlar olish
+        # 1. DeepSeek OCR bilan sinash
+        if self.deepseek_available:
+            try:
+                result = self._extract_with_deepseek(image_bytes)
+                if result:
+                    return result
+                print("⚠️ DeepSeek natija bermadi, Tesseract fallback...", flush=True)
+            except Exception as e:
+                print(f"⚠️ DeepSeek xatosi: {e}. Tesseract fallback...", flush=True)
+
+        # 2. Tesseract fallback
+        return self._extract_with_tesseract(image_bytes)
+
+    def _extract_with_deepseek(self, image_bytes: bytes) -> Optional[Tuple[str, str]]:
+        """DeepSeek OCR model bilan MRZ qatorlarini ajratish"""
+        print(f"🤖 DeepSeek OCR ishlatilmoqda ({Config.DEEPSEEK_MODEL})...", flush=True)
+
+        # Rasmni base64 ga o'girish
+        base64_image = base64.b64encode(image_bytes).decode('utf-8')
+
+        # Rasm formatini aniqlash
+        if image_bytes[:4] == b'\x89PNG':
+            mime_type = "image/png"
+        elif image_bytes[:2] == b'\xff\xd8':
+            mime_type = "image/jpeg"
+        elif image_bytes[:4] == b'RIFF':
+            mime_type = "image/webp"
+        else:
+            mime_type = "image/jpeg"
+
+        # DeepSeek API ga so'rov
+        response = self.client.chat.completions.create(
+            model=Config.DEEPSEEK_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a passport MRZ (Machine Readable Zone) OCR specialist. "
+                        "Extract the two MRZ lines from the passport image. "
+                        "MRZ is located at the bottom of the passport and consists of exactly 2 lines, "
+                        "each exactly 44 characters long. "
+                        "Characters allowed: A-Z, 0-9, and < (filler character). "
+                        "Line 1 starts with 'P<'. "
+                        "Line 2 contains passport number, nationality, dates, and check digits. "
+                        "Return ONLY the two MRZ lines, one per line, nothing else. "
+                        "Do not add any explanation or formatting."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{mime_type};base64,{base64_image}"
+                            }
+                        },
+                        {
+                            "type": "text",
+                            "text": "Extract the two MRZ lines from this passport image. Return ONLY the two 44-character MRZ lines, one per line."
+                        }
+                    ]
+                }
+            ],
+            max_tokens=200,
+            temperature=0.0
+        )
+
+        # Natijani qayta ishlash
+        raw_text = response.choices[0].message.content.strip()
+        print(f"   DeepSeek raw natija: {raw_text}", flush=True)
+
+        lines = []
+        for line in raw_text.split('\n'):
+            cleaned = self._clean_line(line.strip())
+            if len(cleaned) >= 38:
+                lines.append(cleaned)
+
+        if len(lines) >= 2:
+            line1 = self._normalize_line(lines[0])
+            line2 = self._normalize_line(lines[1])
+
+            score = self._score_mrz(line1, line2)
+            print(f"✅ DeepSeek MRZ topildi (score={score})", flush=True)
+            print(f"   Line1: {line1}", flush=True)
+            print(f"   Line2: {line2}", flush=True)
+
+            if score >= 30:
+                return line1, line2
+
+        # Agar natija yomon bo'lsa - concatenated holatini tekshirish
+        full_text = self._clean_line(''.join(raw_text.split()))
+        if len(full_text) >= 80 and 'P<' in full_text[:10]:
+            split_lines = self._smart_split(full_text)
+            if len(split_lines) >= 2:
+                line1 = self._normalize_line(split_lines[0])
+                line2 = self._normalize_line(split_lines[1])
+                return line1, line2
+
+        return None
+
+    def _extract_with_tesseract(self, image_bytes: bytes) -> Tuple[str, str]:
+        """Tesseract OCR fallback"""
+        print("🔍 Tesseract OCR fallback ishlatilmoqda...", flush=True)
+
         detector = MRZDetector()
         image_variants = detector.detect_and_extract(image_bytes)
 
@@ -405,9 +536,7 @@ class LocalOCREngine:
 
         all_candidates = []
 
-        # Har bir rasm varianti uchun
         for i, img in enumerate(image_variants):
-            # Har bir OCR config uchun
             for j, config in enumerate(self.OCR_CONFIGS):
                 try:
                     raw_text = pytesseract.image_to_string(img, lang='eng', config=config)
@@ -417,18 +546,16 @@ class LocalOCREngine:
                         line1 = self._normalize_line(lines[0])
                         line2 = self._normalize_line(lines[1])
 
-                        # Sifatni baholash
                         score = self._score_mrz(line1, line2)
                         all_candidates.append((score, line1, line2, i, j))
                         print(f"   Variant {i+1}, Config {j+1}: score={score}", flush=True)
 
-                except Exception as e:
+                except Exception:
                     continue
 
         if not all_candidates:
             raise ValueError("MRZ topilmadi. Aniqroq rasm yuboring.")
 
-        # Eng yaxshi natijani tanlash
         all_candidates.sort(reverse=True, key=lambda x: x[0])
         best = all_candidates[0]
 
@@ -442,44 +569,37 @@ class LocalOCREngine:
         """MRZ sifatini baholash"""
         score = 0
 
-        # Line 1 tekshiruvlari
         if line1.startswith('P'):
             score += 20
         if line1.startswith('P<'):
-            score += 10  # P< dan boshlanishi yaxshiroq
+            score += 10
         if '<' in line1:
             score += 10
         if '<<' in line1:
             score += 15
 
-        # Line 2 tekshiruvlari
         digit_count = sum(c.isdigit() for c in line2)
-        score += min(digit_count * 2, 30)  # Max 30 ball
+        score += min(digit_count * 2, 30)
 
-        # O'zbekiston pasporti prefikslari
         uzb_prefixes = {'AA', 'AB', 'AC', 'AD', 'FA', 'FB', 'FC', 'FD', 'FK', 'HA', 'HB'}
         if line2[:2] in uzb_prefixes:
             score += 25
 
-        # Nationality to'g'ri aniqlangan (UZB)
         if len(line2) >= 13:
             nationality = line2[10:13]
             if nationality == 'UZB':
-                score += 20  # UZB to'g'ri o'qilgan
+                score += 20
 
-        # Jins to'g'ri aniqlangan (M yoki F) - MUHIM
         if len(line2) >= 21:
             sex_char = line2[20]
             if sex_char in ('M', 'F'):
-                score += 25  # To'g'ri M yoki F
+                score += 25
             elif sex_char in ('N', 'W', 'H', 'K'):
-                score -= 10  # N - bu xato (M bo'lishi kerak)
+                score -= 10
 
-        # < belgilari soni (MRZ da ko'p bo'lishi kerak)
         chevron_count = line1.count('<') + line2.count('<')
         score += min(chevron_count, 20)
 
-        # Uzunlik tekshiruvi
         if len(line1) == 44:
             score += 10
         if len(line2) == 44:
@@ -494,17 +614,14 @@ class LocalOCREngine:
         for line in text.split('\n'):
             cleaned = self._clean_line(line)
 
-            if len(cleaned) >= 38:  # Minimum uzunlik
-                # P< bilan boshlansa - Line 1
+            if len(cleaned) >= 38:
                 if cleaned.startswith('P') or 'P<' in cleaned[:5]:
                     candidates.insert(0, cleaned)
-                # Raqamlar ko'p bo'lsa - Line 2
                 elif sum(c.isdigit() for c in cleaned) >= 8:
                     candidates.append(cleaned)
                 elif len(cleaned) >= 42:
                     candidates.append(cleaned)
 
-        # Concatenated MRZ (80+ belgi)
         full_text = ''.join(text.split())
         full_text = self._clean_line(full_text)
         if len(full_text) >= 80 and 'P<' in full_text[:10]:
@@ -514,8 +631,6 @@ class LocalOCREngine:
 
     def _smart_split(self, text: str) -> List[str]:
         """Uzun matnni 2 qatorga ajratish"""
-        # Line 2 boshlanishini topish
-        # O'zbekiston pasportlari: AA, FA, FK, HA va h.k.
         pattern = r'([A-Z]{2}\d{7})(\d)([A-Z]{3})(\d{6})(\d)'
         match = re.search(pattern, text)
 
@@ -528,7 +643,6 @@ class LocalOCREngine:
                 line1 = text[:split_pos]
                 line2 = text[split_pos:split_pos+44]
         else:
-            # Default split
             line1 = text[:44]
             line2 = text[44:88]
 
@@ -916,11 +1030,11 @@ class ICAO9303Parser:
 # ============================================
 
 class LocalPassportScanner:
-    """To'liq lokal pasport scanner"""
+    """Pasport scanner - DeepSeek OCR + Tesseract fallback"""
 
     def __init__(self):
         self.security = SecurityModule()
-        self.ocr = LocalOCREngine()
+        self.ocr = DeepSeekOCREngine()
         print(f"✅ {Config.SERVICE_NAME} v{Config.VERSION} tayyor", flush=True)
 
     def scan(self, image_bytes: bytes, filename: str = "unknown") -> Dict:
@@ -928,7 +1042,7 @@ class LocalPassportScanner:
         start_time = time.time()
 
         try:
-            # 1. OCR - MRZ qatorlarini ajratish
+            # 1. OCR - MRZ qatorlarini ajratish (DeepSeek yoki Tesseract)
             line1, line2 = self.ocr.extract_mrz_lines(image_bytes)
 
             # 2. Parse - ICAO 9303 bo'yicha
@@ -936,13 +1050,14 @@ class LocalPassportScanner:
 
             # 3. Metadata
             scan_time = time.time() - start_time
+            engine_name = f"DeepSeek OCR ({Config.DEEPSEEK_MODEL})" if self.ocr.deepseek_available else "Tesseract OCR (Fallback)"
             parsed_data["scan_metadata"] = {
                 "timestamp": datetime.utcnow().isoformat() + "Z",
                 "file_name": filename,
                 "scan_time_ms": int(scan_time * 1000),
                 "scanner": f"{Config.SERVICE_NAME} v{Config.VERSION}",
-                "engine": "Tesseract OCR (Lokal)",
-                "api_used": False
+                "engine": engine_name,
+                "api_used": self.ocr.deepseek_available
             }
 
             return parsed_data
@@ -995,8 +1110,9 @@ async def health_check():
         "status": "healthy",
         "service": Config.SERVICE_NAME,
         "version": Config.VERSION,
-        "engine": "Tesseract OCR (Lokal)",
-        "api_required": False
+        "engine": f"DeepSeek OCR ({Config.DEEPSEEK_MODEL})",
+        "fallback_engine": "Tesseract OCR",
+        "deepseek_configured": bool(Config.DEEPSEEK_API_KEY)
     }
 
 
@@ -1063,10 +1179,10 @@ if __name__ == "__main__":
 
     print(f"""
 ╔══════════════════════════════════════════════════════════════════╗
-║         BOJXONA PASSPORT SCANNER - LOKAL VERSIYA                 ║
+║         BOJXONA PASSPORT SCANNER - DeepSeek OCR                  ║
 ║                                                                  ║
-║  🔒 API YO'Q - Barcha ma'lumotlar lokal qayta ishlanadi         ║
-║  ✅ Tesseract OCR - Offline ishlaydi                            ║
+║  🤖 DeepSeek OCR - DeepSeek-OCR-Latest-BF16.I64 model          ║
+║  ✅ Tesseract OCR - Fallback engine                             ║
 ║  ✅ ICAO 9303 TD3 - Xalqaro standart                            ║
 ║  ✅ Yaxshilangan MRZ Detection (Morphological)                  ║
 ║                                                                  ║
